@@ -22,20 +22,25 @@ const POLL_MS = 10_000
 const LEAVE_COLLECT_MS = 45_000
 const LEAVE_REQ_TTL_MS = 10 * 60 * 1000
 const RT_KEEP_MS = 3 * 24 * 60 * 60 * 1000
-// Phone push and replies go through the person's ntfy setup (agent-notify).
-const NTFY_CONFIG = '/Users/luwux/Codefield/Misc/tools/agent-notify/config.json'
+// Settings the person picks in /config (plugin.json userConfig); register() fills them in.
+type Idle = 'off' | 'notify' | 'judge'
+const cfg = {
+  // A JSON file {"server": "https://ntfy.sh", "topic": "..."}; empty means no phone push.
+  ntfyConfigFile: '',
+  remindMinCtx: 250_000, // below this a cold rewrite is not worth an interruption
+  awayIdleS: 5 * 60,
+  pingMaxPerWindow: 15,
+  idleDefault: 'notify' as Idle,
+}
 const PING_AFTER_MS = 50 * 60 * 1000
 const CHECK_AFTER_MS = 50 * 60 * 1000
 const MIN_PING_MS = 60 * 1000
 const DEFAULT_WINDOW_MS = 3 * 60 * 60 * 1000
 const MAX_WINDOW_MS = 12 * 60 * 60 * 1000
 const MIN_CTX = 30_000
-const REMIND_MIN_CTX = 250_000 // below this a cold rewrite is not worth an interruption
 const END_WARN_MS = 10 * 60 * 1000
 // Hard brakes on pings, whatever the timers say.
 const PING_MIN_GAP_MS = 40 * 60 * 1000
-const PING_MAX_PER_WINDOW = 15
-const AWAY_IDLE_S = 5 * 60
 const GUARD_MIN_CTX = 50_000
 const PING_PROMPT = 'Reply with the single word: warm'
 const TOOL = 'mcp__keepwarm__keepwarm'
@@ -88,8 +93,6 @@ type State = {
   endWarnedFor: number
   windowPings: number
   tick: Timer | null
-  // Waiting-for-you mark: ⏳ in the session title while the turn ended waiting on the person.
-  markMode: 'haiku' | 'fork' | 'off'
   caff: AsyncGenerator<unknown, unknown> | null
   checkedFor: number
   // Last real turn. Forks refresh lastRequestAt but are not the person coming back.
@@ -98,7 +101,7 @@ type State = {
   collect: Timer | null
   leaveSeen: string
   // The 50-minute idle check: off, a free notice, or a judging fork.
-  idle: 'off' | 'notify' | 'judge'
+  idle: Idle
   last: PingRecord | null
   pings: number
   pingUsd: number
@@ -166,12 +169,13 @@ function card(s: State, now: number): string {
     `cache       ${!s.lastRequestAt ? '本会话还没有请求' : s.compacted ? '刚 compact，等下一轮' : isCold(s, now) ? `已冷（${fmtDuration(now - s.lastRequestAt)} 前最后请求）` : `热，还剩 ${fmtDuration(s.lastRequestAt + TTL_MS - now)}`}`,
     `cold cost   过期后重写一次 ≈ ${fmtUsd(coldUsd(s))}；保温 ≈ ${fmtUsd(hourUsd(s))}/小时`,
     `keepwarm    ${s.deadline ? `开（${s.owner === 'model' ? '模型' : '你'}开的${s.reason ? `：${s.reason}` : ''}${s.wakePrompt ? `；唤醒任务：${s.wakePrompt}` : ''}），剩 ${fmtDuration(s.deadline - now)}` : s.stopped ? `停：${s.stopped}` : '关'}${s.userOff ? '；你已禁止模型开启' : ''}`,
-    `reminder    ${s.policy === 'off' ? '关' : s.check ? `空闲 ${fmtDuration(CHECK_AFTER_MS)} 时检查` : `未排程（需上下文 ≥ ${fmtTok(REMIND_MIN_CTX)} 且无保温）`}`,
+    `reminder    ${s.policy === 'off' ? '关' : s.check ? `空闲 ${fmtDuration(CHECK_AFTER_MS)} 时检查` : `未排程（需上下文 ≥ ${fmtTok(cfg.remindMinCtx)} 且无保温）`}`,
+    `config      空闲检查 ${s.idle}（默认 ${cfg.idleDefault}）· 提醒门槛 ${fmtTok(cfg.remindMinCtx)} · 每窗口最多 ping ${cfg.pingMaxPerWindow} 次 · 手机推送${cfg.ntfyConfigFile ? `开（离开 ${cfg.awayIdleS / 60} 分钟后）` : '关'}`,
     `guard       ${{ refuse: '冷发送先拦一次（再发即通过）', warn: '不拦，冷写入只记账', off: '关' }[s.guard]}`,
     `cold paid   本会话冷写入 ${s.misses.length} 次，${fmtUsd(s.misses.reduce((a, m) => a + (m.usd ?? 0), 0))}`,
     `this run    ping ${s.pings} 次，合计 ${fmtUsd(s.pingUsd)}${s.last ? `；上次读 ${fmtTok(s.last.read)} 写 ${fmtTok(s.last.write)}` : ''}`,
     '',
-    '/keepwarm on 3h | off | auto | status | check | leave 2h on|off | idle off|notify|judge | mark haiku|fork|off | todo | done | log | policy ask|auto|warm|off | guard refuse|warn|off | ledger',
+    '/keepwarm on 3h | off | auto | status | check | leave 2h on|off | idle off|notify|judge | log | policy ask|auto|warm|off | guard refuse|warn|off | ledger',
   ].join('\n')
 }
 
@@ -289,7 +293,7 @@ async function idleSeconds($: EngineInterface): Promise<number> {
 // A desktop notification always; the phone too when nobody is at the Mac.
 async function alert($: EngineInterface, s: State, title: string, message: string) {
   await notify($, s, title, message)
-  if ((await idleSeconds($)) >= AWAY_IDLE_S) await push($, s, `${project(s)} · ${title}`, message + '\n\n要处理请回到会话里。')
+  if ((await idleSeconds($)) >= cfg.awayIdleS) await push($, s, `${project(s)} · ${title}`, message + '\n\n要处理请回到会话里。')
 }
 
 // The desktop app names its sessions local_<uuid>; its deep link wants that id, and
@@ -400,7 +404,7 @@ async function arm($: EngineInterface, s: State) {
       // Cold or just compacted: never ping (it would pay the rewrite); only expire the window.
       s.pending = $.clock.after(s.deadline - now, () => { void arm($, s) })
     }
-  } else if (live && s.policy !== 'off' && s.idle !== 'off' && s.ctx >= REMIND_MIN_CTX && s.checkedFor !== s.turnAt) {
+  } else if (live && s.policy !== 'off' && s.idle !== 'off' && s.ctx >= cfg.remindMinCtx && s.checkedFor !== s.turnAt) {
     // One reminder per idle stretch, before the cache lapses.
     s.check = $.clock.after(Math.max(1000, s.lastRequestAt + CHECK_AFTER_MS - now), () => { void idleCheck($, s) })
   }
@@ -429,83 +433,6 @@ async function loadRuntime($: EngineInterface, s: State, now: number) {
   s.window = rt.window
   s.lastModel = rt.model
   s.compacted = rt.compacted
-}
-
-// ---------- waiting-for-you mark (⏳ in the desktop session title) ----------
-
-const MARK = '⏳ '
-const HAIKU_PRICE: [number, number] = [1, 5] // $/MTok in, out
-
-const markPrompt = (excerpt: string) => [
-  '[keepwarm 状态判断，不是用户消息；不要调用工具，只输出一行 JSON]',
-  excerpt,
-  '判断：助手这一轮结束时，是否在等用户做事？包括回答问题、做决定或选择、测试或确认结果、手动操作、审阅内容。',
-  '助手只是汇报完成、没有任何需要用户做的，就是 false；只是客套地问"还有别的吗"也算 false。',
-  '输出格式：{"waiting":true|false,"action":"<需要用户做什么，中文，等的话写清楚；不等则空>"}',
-].join('\n')
-
-type ApiMsg = { role: string; content: string | Array<{ type: string; text?: string }> }
-const textOf = (m: ApiMsg) => typeof m.content === 'string' ? m.content : m.content.filter(b => b.type === 'text').map(b => b.text ?? '').join('\n')
-
-// The person's last prompt and the assistant's text since it: enough to tell whether the turn
-// ended on a question to them.
-async function lastExchange($: EngineInterface): Promise<string | null> {
-  const msgs = (await $.session.messages({ as: 'api' })) as unknown as ApiMsg[]
-  const said: string[] = []
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i]
-    if (!m) continue
-    const text = textOf(m).trim()
-    if (m.role === 'assistant') { if (text) said.unshift(text) }
-    else if (text && !text.startsWith('<')) {
-      return `用户最后一条消息：\n${text.slice(0, 4000)}\n\n助手这一轮的回复（结尾部分）：\n${said.join('\n').slice(-6000)}`
-    }
-  }
-  return null
-}
-
-async function setMark($: EngineInterface, s: State, waiting: boolean): Promise<boolean> {
-  const ds = await desktopSession($, s)
-  if (!ds || !ds.title) return false
-  const marked = ds.title.startsWith(MARK.trim())
-  if (marked === waiting) return true
-  const title = waiting ? MARK + ds.title : ds.title.replace(/^⏳\s*/, '')
-  try {
-    const r = await auditedMcp($, s, waiting ? '标题加 ⏳' : '标题去 ⏳', 'ccd_session_mgmt', 'set_session_title', { session_id: 'self', title })
-    return !r.isError
-  } catch {
-    return false
-  }
-}
-
-async function judgeWaiting($: EngineInterface, s: State) {
-  if (s.markMode === 'off') return
-  const now = await $.clock.now()
-  let text = ''
-  let usd: number | null = null
-  let read = 0, write = 0
-  if (s.markMode === 'fork') {
-    const r = await auditedFork($, s, '⏳ 判断（fork）', markPrompt('（对话就在上面，看最后一轮）'))
-    if (!r.isAnswered) return
-    text = r.text
-    usd = forkUsd(r.usage, priceOf(s.lastModel))
-    read = r.usage.cache_read_input_tokens
-    write = r.usage.cache_creation_input_tokens
-    if (forkWasWarm(r.usage)) s.lastRequestAt = now
-  } else {
-    const ex = await lastExchange($)
-    if (!ex) return
-    const r = await auditedComplete($, s, '⏳ 判断（haiku）', 'haiku', markPrompt(ex), 300, HAIKU_PRICE)
-    if (!r.isAnswered) return
-    text = r.text
-    usd = (r.usage.input_tokens * HAIKU_PRICE[0] + r.usage.output_tokens * HAIKU_PRICE[1]) / 1e6
-  }
-  const m = /\{[\s\S]*\}/.exec(text)
-  let waiting = false
-  let action = ''
-  try { const v = JSON.parse(m ? m[0] : '{}') as { waiting?: unknown; action?: unknown }; waiting = v.waiting === true; action = String(v.action ?? '') } catch { return }
-  const ok = await setMark($, s, waiting)
-  await appendLog($, 'marks', { sid: s.sid, at: now, mode: s.markMode, waiting, action, usd, read, write, titled: ok })
 }
 
 // ---------- leave: every live session at once ----------
@@ -594,7 +521,8 @@ type Ntfy = { server: string; topic: string }
 
 async function ntfyConfig($: EngineInterface): Promise<Ntfy | null> {
   try {
-    const r = await $.process.run(['cat', NTFY_CONFIG])
+    if (!cfg.ntfyConfigFile) return null
+    const r = await $.process.run(['sh', '-c', 'f=$1; case $f in "~/"*) f="$HOME/${f#??}";; esac; cat "$f"', 'kw', cfg.ntfyConfigFile])
     const c = JSON.parse(r.stdout) as Partial<Ntfy>
     return c.server && c.topic ? { server: c.server.replace(/\/$/, ''), topic: c.topic } : null
   } catch {
@@ -647,7 +575,7 @@ async function ping($: EngineInterface, s: State) {
     s.pending = $.clock.after(s.last.at + PING_MIN_GAP_MS - now, () => { void ping($, s) })
     return
   }
-  if (s.windowPings >= PING_MAX_PER_WINDOW) return stop($, s, `这个保温窗口已 ping ${s.windowPings} 次，达到上限`)
+  if (s.windowPings >= cfg.pingMaxPerWindow) return stop($, s, `这个保温窗口已 ping ${s.windowPings} 次，达到上限`)
   s.windowPings += 1
   const reply = await auditedFork($, s, s.wakePrompt ? '保温 ping（带唤醒判断）' : '保温 ping', s.wakePrompt ? wakeJudgePrompt(s, now) : PING_PROMPT)
   if (!reply.isAnswered && reply.reason === 'nothing-to-fork') return stop($, s, '没有可以 fork 的对话')
@@ -923,10 +851,17 @@ function hoursOf(v: unknown): number {
   return Math.min(Math.max(h, 0.25), MAX_WINDOW_MS / 3_600_000)
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const num = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : d)
+  cfg.ntfyConfigFile = typeof options.ntfyConfigFile === 'string' ? options.ntfyConfigFile.trim() : ''
+  cfg.remindMinCtx = num(options.remindMinContext, cfg.remindMinCtx)
+  cfg.awayIdleS = num(options.awayMinutes, cfg.awayIdleS / 60) * 60
+  cfg.pingMaxPerWindow = num(options.pingMaxPerWindow, cfg.pingMaxPerWindow)
+  const idle = options.idleCheck
+  cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
     sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, coldPending: false, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false,
-    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, windowPings: 0, tick: null, markMode: 'off', caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: 'judge',
+    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, windowPings: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
     last: null, pings: 0, pingUsd: 0, stopped: null,
   }
 
@@ -958,10 +893,8 @@ export const register: Register = on => {
     })
     if (s.poll) s.poll.cancel()
     s.poll = $.clock.every(POLL_MS, () => { void poll($, s) })
-    const mark = await $.store.get('mark')
-    s.markMode = mark === 'fork' || mark === 'haiku' ? mark : 'off' // off until the person turns it on
     const idle = await $.store.get('idle')
-    s.idle = idle === 'off' || idle === 'notify' ? idle : 'judge'
+    s.idle = idle === 'off' || idle === 'notify' || idle === 'judge' ? idle : cfg.idleDefault
     const policy = await $.store.get(`policy:${s.cwd}`)
     s.policy = policy === 'auto' || policy === 'warm' || policy === 'off' ? policy : 'ask'
     const guard = await $.store.get('guard')
@@ -972,8 +905,8 @@ export const register: Register = on => {
     s.lastModel = await $.session.model()
     await $.command.register({
       name: 'keepwarm',
-      description: '缓存保温与空闲提醒：on 3h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | mark haiku/fork/off | todo | done | log | policy ask|auto|warm|off',
-      argumentHint: '[on 3h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | mark haiku/fork/off | todo | done | log | policy ask|auto|warm|off]',
+      description: '缓存保温与空闲提醒：on 3h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | log | policy ask|auto|warm|off',
+      argumentHint: '[on 3h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | log | policy ask|auto|warm|off]',
       immediate: true,
     })
     await $.tool.register({
@@ -1094,19 +1027,6 @@ export const register: Register = on => {
       const mine = leaveSkip(s, now)
       return { text: `已通知所有开着的会话：离开 ${fmtDuration(hours * 3_600_000)}（${machineOn ? '电脑开着' : '合盖/关机'}）。缓存还热的会话各自判断一次，约 ${LEAVE_COLLECT_MS / 1000} 秒内汇总到输入框上方并推送到手机` + (mine ? `（本会话${mine}，不参与）` : '') }
     }
-    if (cmd === 'mark') {
-      const v = words[1]
-      if (v !== 'haiku' && v !== 'fork' && v !== 'off') return { text: `⏳ 标记：${s.markMode}。用法：/keepwarm mark haiku|fork|off（所有会话）。haiku 只看最后一轮问答，约 $0.002/轮；fork 让会话问它自己，每轮读一遍完整上下文（${fmtTok(s.ctx)} 约 ${fmtUsd(hourUsd(s) != null ? (hourUsd(s) as number) * s.every / TTL_MS : null)}/轮）` }
-      s.markMode = v
-      await $.store.set('mark', v)
-      await audit($, s, 'change', '改设置', { key: 'mark', value: v })
-      if (v === 'off') await setMark($, s, false)
-      return { text: `⏳ 标记改为 ${v}` }
-    }
-    if (cmd === 'todo' || cmd === 'done') {
-      const ok = await setMark($, s, cmd === 'todo')
-      return { text: ok ? (cmd === 'todo' ? '已标上 ⏳' : '已去掉 ⏳') : '没改成：找不到这个会话的桌面端记录（只在桌面 app 里有效）' }
-    }
     if (cmd === 'log') {
       // The audit trail: every request keepwarm paid for and every change it made.
       type A = { at: number; sid?: string; kind: string; what: string; usd?: number; read?: number; write?: number; in?: number; out?: number; ok?: boolean; error?: string; answered?: boolean; reason?: string }
@@ -1187,8 +1107,6 @@ export const register: Register = on => {
       if (a) await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: a.ctx, advised: a.action, reason: a.reason, chosen: 'returned', by: 'user' })
       await update($, advice, () => null)
     }
-    // Replying is handling it: drop ⏳ now; the turn's end judges again. Reading alone never does.
-    if (e.origin.kind !== 'plugin' && s.markMode !== 'off' && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) void setMark($, s, false)
     // The person is back: the absence a keep-warm window covered is over. A slash command
     // (e.g. /keepwarm on) is not a return; the model may start a new window itself.
     if (e.origin.kind !== 'plugin' && s.deadline && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) {
@@ -1248,7 +1166,6 @@ export const register: Register = on => {
     s.ackedAt = 0
     s.window = usage.context.window
     await arm($, s)
-    void judgeWaiting($, s)
     return r
   })
 
