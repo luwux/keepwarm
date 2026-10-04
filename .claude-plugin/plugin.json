@@ -1,0 +1,7 @@
+{
+  "name": "keepwarm",
+  "version": "0.2.0",
+  "description": "Idle-session cache guard: after ~50 idle minutes asks a cache-read fork whether to compact, keep warm or ignore, and notifies; the model can start/stop keep-warm via a tool. Derived from cache-tax (MIT, Karan Bansal).",
+  "author": { "name": "luwux" },
+  "types": "./types/index.d.ts"
+}
