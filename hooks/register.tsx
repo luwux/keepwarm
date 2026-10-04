@@ -302,7 +302,9 @@ const DESKTOP_SESSIONS = '$HOME/Library/Application Support/Claude/claude-code-s
 
 async function desktopSession($: EngineInterface, s: State): Promise<{ id: string; title: string } | null> {
   try {
-    const r = await $.process.run(['sh', '-c', `grep -rl --include='local_*.json' -F "\"cliSessionId\":\"$1\"" "${DESKTOP_SESSIONS}" 2>/dev/null | head -1 | xargs -I{} cat "{}"`, 'kw', s.sid])
+    // The pattern goes in as an argument: quotes written inside this template literal would be
+    // eaten by JS and then by sh, and grep would search for cliSessionId:<id> and never match.
+    const r = await $.process.run(['sh', '-c', `f=$(grep -rl --include='local_*.json' -F -e "$1" "${DESKTOP_SESSIONS}" 2>/dev/null | head -1) && [ -n "$f" ] && cat "$f"`, 'kw', `"cliSessionId":"${s.sid}"`])
     const d = JSON.parse(r.stdout) as { sessionId?: string; cliSessionId?: string; title?: string }
     return d.cliSessionId === s.sid && d.sessionId?.startsWith('local_') ? { id: d.sessionId, title: d.title ?? '' } : null
   } catch {
