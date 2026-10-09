@@ -356,11 +356,16 @@ async function alarm($: EngineInterface, s: State, kind: AlarmKind, title: strin
   await alert($, s, `⚠️ ${title}`, message)
 }
 
-// What keepwarm spent today on requests nobody asked for.
-async function autoSpendToday($: EngineInterface, now: number): Promise<number> {
+// What keepwarm spent today, split into what it chose to spend and what the person asked for.
+// Only the first has a budget: pausing the second would undo what they asked for, and with many
+// sessions each kept warm on purpose the total grows past any fixed line. The person's own
+// windows are bounded per session by pingLimit instead.
+async function spendToday($: EngineInterface, now: number): Promise<{ auto: number; manual: number }> {
   const from = dayStart(now)
   const log = ((await $.store.get('audit')) as Array<{ at: number; kind: string; usd?: number; manual?: boolean }> | undefined) ?? []
-  return log.reduce((a, r) => a + (r.at >= from && r.kind === 'request' && !r.manual ? r.usd ?? 0 : 0), 0)
+  const out = { auto: 0, manual: 0 }
+  for (const r of log) if (r.at >= from && r.kind === 'request') out[r.manual ? 'manual' : 'auto'] += r.usd ?? 0
+  return out
 }
 
 async function overBudget($: EngineInterface): Promise<boolean> {
@@ -370,7 +375,7 @@ async function overBudget($: EngineInterface): Promise<boolean> {
 async function checkBudget($: EngineInterface, s: State) {
   if (!cfg.dailyBudgetUsd || (await overBudget($))) return
   const now = await $.clock.now()
-  const spent = await autoSpendToday($, now)
+  const spent = (await spendToday($, now)).auto
   if (spent <= cfg.dailyBudgetUsd) return
   await $.store.set('budgetHit', dayStart(now))
   await audit($, s, 'change', '今日自动花费超过上限', { spent, budget: cfg.dailyBudgetUsd })
@@ -381,9 +386,11 @@ async function checkBudget($: EngineInterface, s: State) {
 
 async function alertLine($: EngineInterface, now: number): Promise<string> {
   const on = (await $.store.get('alert')) === true
-  const spent = await autoSpendToday($, now)
+  const spent = await spendToday($, now)
   const over = await overBudget($)
-  return `alerts      报警${on ? '开' : '关'}（/keepwarm alert on|off）· 今日自动花费 ${fmtUsd(spent)}${cfg.dailyBudgetUsd ? ` / 上限 $${cfg.dailyBudgetUsd}` : ''}${over ? '，已超，空闲检查改为免费提醒' : ''}`
+  return `alerts      报警${on ? '开' : '关'}（/keepwarm alert on|off|test）\n` +
+    `today       keepwarm 今天共花 ${fmtUsd(spent.auto + spent.manual)}：自己主动的 ${fmtUsd(spent.auto)}${cfg.dailyBudgetUsd ? `（上限 $${cfg.dailyBudgetUsd}${over ? '，已超，空闲检查改为免费提醒' : ''}）` : ''}，` +
+    `你要求的 ${fmtUsd(spent.manual)}（你开的保温、check、离开判断；不设上限，每会话 ${cfg.pingLimitHours} 小时最多 ping ${cfg.pingLimit} 次）`
 }
 
 // The desktop app names its sessions local_<uuid>; its deep link wants that id, and
