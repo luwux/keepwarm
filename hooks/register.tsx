@@ -6,9 +6,10 @@
 //    judges whether to compact, keep warm or ignore. The verdict shows as a band
 //    above the prompt with buttons, a toast and a macOS notification; per-project
 //    policy can apply it automatically.
-// 2. Keep-warm: the same fork, sent every 50 idle minutes inside a window. The
-//    model starts and stops it with the mcp__keepwarm__keepwarm tool; the
-//    person's /keepwarm overrides the model.
+// 2. Keep-warm: the same fork, sent when 55 minutes have passed since the last
+//    request, inside a window. The person's /keepwarm on 8h holds for its hours
+//    whatever happens; the model may also start one with the
+//    mcp__keepwarm__keepwarm tool, and the person's /keepwarm overrides the model.
 //
 // Keep-warm is derived from cache-tax (MIT, Karan Bansal, github.com/karanb192/cache-tax).
 import { atom, read, update } from 'claude-code'
@@ -32,7 +33,9 @@ const cfg = {
   pingMaxPerWindow: 15,
   idleDefault: 'notify' as Idle,
 }
-const PING_AFTER_MS = 50 * 60 * 1000
+// Ping when the hour has five minutes left, whatever the session is doing (working, waiting on
+// background work, waiting on the person): only the time since the last request counts.
+const PING_AFTER_MS = 55 * 60 * 1000
 const CHECK_AFTER_MS = 50 * 60 * 1000
 const MIN_PING_MS = 60 * 1000
 const DEFAULT_WINDOW_MS = 3 * 60 * 60 * 1000
@@ -991,7 +994,7 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'keepwarm',
       description:
-        "Keeps this session's 1-hour prompt cache warm while the user is away: every 50 idle minutes it sends a tool-less fork " +
+        "Keeps this session's 1-hour prompt cache warm while the user is away: 55 minutes after the last request it sends a tool-less fork " +
         'of this conversation that is billed at the cache-read rate and adds nothing to the transcript, instead of the user ' +
         'paying a full cache re-write when they come back (e.g. 400K tokens on Opus 5.5: ~$0.10/h warm vs ~$3.20 cold). ' +
         'Call action "start" when you end a turn with a large context (100K+ tokens) and the user will plausibly return to ' +
@@ -1067,7 +1070,7 @@ export const register: Register = (on, options) => {
     if (s.ctx < MIN_CTX) return { result: `Not started: the context is only ${fmtTok(s.ctx)} tokens, so a cold re-write costs about ${fmtUsd(coldUsd(s))}; keeping it warm is not worth it.` }
     const wake = typeof input.wake_prompt === 'string' ? input.wake_prompt.trim().slice(0, 500) : ''
     await startWindow($, s, hoursOf(input.hours) * 3_600_000, 'model', reason, wake)
-    const cold = isCold(s, now) ? ' The cache is cold right now, so pings begin 50 minutes after the next turn.' : ''
+    const cold = isCold(s, now) ? ' The cache is cold right now, so pings begin 55 minutes after the next turn.' : ''
     return { result: `keepwarm on for ${fmtDuration(s.deadline - now)} (owner: ${s.owner})${wake ? ', with a wake task' : ''}. About ${fmtUsd(hourUsd(s))}/h vs ${fmtUsd(coldUsd(s))} for one cold re-write.${cold}` }
   })
 
@@ -1175,7 +1178,7 @@ export const register: Register = (on, options) => {
       s.every = every
       s.userOff = false
       await startWindow($, s, ms, 'user', '手动开启')
-      return { text: `保温开启 ${fmtDuration(s.deadline - now)}，约 ${fmtUsd(hourUsd(s))}/小时（过期重写一次约 ${fmtUsd(coldUsd(s))}）` }
+      return { text: `保温开启 ${fmtDuration(s.deadline - now)}：这段时间里缓存不会过期，不管会话在干活、等后台任务还是等你；你发消息也不会取消，/keepwarm off 关。闲着时约 ${fmtUsd(hourUsd(s))}/小时（过期重写一次约 ${fmtUsd(coldUsd(s))}）` }
     }
     return { text: card(s, now) }
   })
@@ -1187,9 +1190,10 @@ export const register: Register = (on, options) => {
       if (a) await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: a.ctx, advised: a.action, reason: a.reason, chosen: 'returned', by: 'user' })
       await update($, advice, () => null)
     }
-    // The person is back: the absence a keep-warm window covered is over. A slash command
-    // (e.g. /keepwarm on) is not a return; the model may start a new window itself.
-    if (e.origin.kind !== 'plugin' && s.deadline && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) {
+    // The person is back: the absence the model guessed at is over; it may start a new window
+    // itself. A window the person opened runs its hours whatever they do: while they work their
+    // own requests keep the cache warm and no ping goes out, so it costs nothing until they stop.
+    if (e.origin.kind !== 'plugin' && s.deadline && s.owner === 'model' && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) {
       await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: s.ctx, advised: 'keepwarm', reason: s.reason, chosen: 'returned-stop', by: 'user' })
       await stop($, s, null)
       s.stopped = null
@@ -1218,7 +1222,8 @@ export const register: Register = (on, options) => {
       $.ui.status(statusText(s, now))
     }
     const res = yield* next(e)
-    if (!e.agentId && res.usage) await checkMiss($, s, res.usage, before)
+    // Bookkeeping only: whatever goes wrong here must not touch the request.
+    if (!e.agentId && res?.usage) await checkMiss($, s, res.usage, before).catch(err => $.ui.log(`keepwarm：冷写入记录失败 ${errText(err)}`, { to: 'debug' }))
     return res
   })
 

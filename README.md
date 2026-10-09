@@ -16,8 +16,11 @@ each session and speaks up *before* the hour runs out.
   above the prompt. With `idleCheck: judge` a fork of the session first decides whether to
   compact, keep warm or leave it; the fork reads the cache (it costs the cache-read rate,
   about $0.03–0.10 at 100–400K tokens) and refreshes it.
-- **Keep-warm windows**: `/keepwarm on 3h` pings the cache every ~50 idle minutes inside a
-  window, capped by `pingMaxPerWindow`; sending a message ends the window.
+- **Keep-warm windows**: `/keepwarm on 8h` pings the cache whenever 55 minutes have passed since
+  the last request, for 8 hours, whatever the session is doing: working, waiting on background
+  work, or waiting on you. Your messages do not end a window you opened (while you work, your own
+  requests keep the cache warm and nothing is sent); one the model opened ends when you write.
+  Capped by `pingMaxPerWindow`.
 - **Leaving**: `/keepwarm leave 2h` asks every live, warm session for its own verdict and
   shows one summary.
 - **Never blocks** a prompt unless you turn `guard refuse` on.
