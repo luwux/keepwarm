@@ -1,6 +1,6 @@
 {
   "name": "keepwarm",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "Idle-session guard for Claude Code's 1-hour prompt cache (macOS): about 50 idle minutes after the last turn of a large session it notifies you, optionally after a cache-read fork judges whether to compact, keep warm or leave it; every request and change it makes is audited. Derived from cache-tax (MIT, Karan Bansal).",
   "author": {
     "name": "luwux"
@@ -24,11 +24,23 @@
       "description": "Sessions smaller than this are never reminded: a cold rewrite of them is cheap.",
       "default": 250000
     },
-    "pingMaxPerWindow": {
+    "pingLimit": {
       "type": "number",
-      "title": "Max keep-warm pings per window",
-      "description": "Hard cap on keep-warm pings in one window; keep-warm stops when it is reached.",
+      "title": "Max keep-warm pings per session",
+      "description": "Safety net: at most this many pings per session within pingLimitHours (one every 55 minutes is 13 in 12 hours). Reaching it stops keep-warm and, with alerts on, notifies you.",
       "default": 15
+    },
+    "pingLimitHours": {
+      "type": "number",
+      "title": "Ping limit period (hours)",
+      "description": "The rolling period pingLimit counts over.",
+      "default": 12
+    },
+    "dailyBudgetUsd": {
+      "type": "number",
+      "title": "Daily budget for automatic requests (USD)",
+      "description": "What keepwarm may spend a day on requests you did not ask for (idle judges, pings of windows the model opened). Past it the idle check falls back to the free notice until midnight and, with alerts on, you are notified. 0: no limit.",
+      "default": 3
     },
     "awayMinutes": {
       "type": "number",

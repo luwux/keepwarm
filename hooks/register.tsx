@@ -30,7 +30,13 @@ const cfg = {
   ntfyConfigFile: '',
   remindMinCtx: 250_000, // below this a cold rewrite is not worth an interruption
   awayIdleS: 5 * 60,
-  pingMaxPerWindow: 15,
+  // A safety net against a runaway timer: per session, at most pingLimit pings in any
+  // pingLimitHours (one every 55 minutes is 13 in 12 hours).
+  pingLimit: 15,
+  pingLimitHours: 12,
+  // What keepwarm may spend a day on its own (idle judges, pings of windows the model opened);
+  // past it the idle check falls back to the free notice until midnight. 0: no limit.
+  dailyBudgetUsd: 3,
   idleDefault: 'notify' as Idle,
 }
 // Ping when the hour has five minutes left, whatever the session is doing (working, waiting on
@@ -108,7 +114,6 @@ type State = {
   expire: Timer | null
   endWarn: Timer | null
   endWarnedFor: number
-  windowPings: number
   tick: Timer | null
   caff: AsyncGenerator<unknown, unknown> | null
   checkedFor: number
@@ -187,12 +192,12 @@ function card(s: State, now: number): string {
     `cold cost   过期后重写一次 ≈ ${fmtUsd(coldUsd(s))}；保温 ≈ ${fmtUsd(hourUsd(s))}/小时`,
     `keepwarm    ${s.deadline ? `开（${s.sticky ? '/keepwarm on 开的，发消息不会结束，/keepwarm off 关' : `${s.owner === 'model' ? '模型' : '你'}开的，你回来发消息就结束`}${s.reason ? `：${s.reason}` : ''}${s.wakePrompt ? `；唤醒任务：${s.wakePrompt}` : ''}），剩 ${fmtDuration(s.deadline - now)}` : s.stopped ? `停：${s.stopped}` : '关'}${s.userOff ? '；你已禁止模型开启' : ''}`,
     `reminder    ${s.policy === 'off' ? '关' : s.check ? `空闲 ${fmtDuration(CHECK_AFTER_MS)} 时检查` : `未排程（需上下文 ≥ ${fmtTok(cfg.remindMinCtx)} 且无保温）`}`,
-    `config      空闲检查 ${s.idle}（默认 ${cfg.idleDefault}）· 提醒门槛 ${fmtTok(cfg.remindMinCtx)} · 每窗口最多 ping ${cfg.pingMaxPerWindow} 次 · 手机推送${cfg.ntfyConfigFile ? `开（离开 ${cfg.awayIdleS / 60} 分钟后）` : '关'}`,
+    `config      空闲检查 ${s.idle}（默认 ${cfg.idleDefault}）· 提醒门槛 ${fmtTok(cfg.remindMinCtx)} · 每会话 ${cfg.pingLimitHours} 小时内最多 ping ${cfg.pingLimit} 次 · 自动花费上限 ${cfg.dailyBudgetUsd ? `$${cfg.dailyBudgetUsd}/天` : '不限'} · 手机推送${cfg.ntfyConfigFile ? `开（离开 ${cfg.awayIdleS / 60} 分钟后）` : '关'}`,
     `guard       ${{ refuse: '冷发送先拦一次（再发即通过）', warn: '不拦，冷写入只记账', off: '关' }[s.guard]}`,
     `cold paid   本会话冷写入 ${s.misses.length} 次，${fmtUsd(s.misses.reduce((a, m) => a + (m.usd ?? 0), 0))}`,
     `this run    ping ${s.pings} 次，合计 ${fmtUsd(s.pingUsd)}${s.last ? `；上次读 ${fmtTok(s.last.read)} 写 ${fmtTok(s.last.write)}` : ''}`,
     '',
-    '/keepwarm on 3h | off | auto | status | check | leave 2h on|off | idle off|notify|judge | log | policy ask|auto|warm|off | guard refuse|warn|off | ledger',
+    '/keepwarm on 8h | off | auto | status | check | leave 2h on|off | idle off|notify|judge | alert on|off | log | policy ask|auto|warm|off | guard refuse|warn|off | ledger',
   ].join('\n')
 }
 
@@ -214,17 +219,19 @@ async function audit($: EngineInterface, s: State, kind: 'request' | 'change' | 
   }
 }
 
-async function auditedFork($: EngineInterface, s: State, purpose: string, prompt: string): Promise<ForkResult> {
+// manual: the person asked for this request (their window's ping, /keepwarm check, a leave);
+// everything else counts against the daily budget.
+async function auditedFork($: EngineInterface, s: State, purpose: string, prompt: string, manual = false): Promise<ForkResult> {
   let r: ForkResult
   try {
     r = await $.model.fork({ prompt })
   } catch (err) {
-    await audit($, s, 'request', purpose, { via: 'fork', model: s.lastModel, error: errText(err) })
+    await audit($, s, 'request', purpose, { via: 'fork', model: s.lastModel, manual, error: errText(err) })
     throw err
   }
   const u = 'usage' in r ? (r.usage as Usage) : null
   await audit($, s, 'request', purpose, {
-    via: 'fork', model: s.lastModel, answered: r.isAnswered, reason: r.isAnswered ? undefined : r.reason,
+    via: 'fork', model: s.lastModel, manual, answered: r.isAnswered, reason: r.isAnswered ? undefined : r.reason,
     read: u?.cache_read_input_tokens ?? 0, write: u?.cache_creation_input_tokens ?? 0, in: u?.input_tokens ?? 0, out: u?.output_tokens ?? 0,
     usd: u ? forkUsd(u, priceOf(s.lastModel)) : 0,
   })
@@ -325,6 +332,60 @@ async function alert($: EngineInterface, s: State, title: string, message: strin
   if ((await idleSeconds($)) >= cfg.awayIdleS) await push($, s, `${project(s)} · ${title}`, message + '\n\n要处理请回到会话里。')
 }
 
+// ---------- alerts: only what should not have happened, opt-in (/keepwarm alert on) ----------
+
+type AlarmKind = 'lapsed' | 'unexplained' | 'budget' | 'pinglimit'
+const ALARM_GAP_MS = 60 * 60 * 1000
+
+const dayStart = (now: number) => {
+  const d = new Date(now)
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+}
+
+// To the Mac (and the phone when you are away), at most once an hour per kind and session.
+async function alarm($: EngineInterface, s: State, kind: AlarmKind, title: string, message: string) {
+  if ((await $.store.get('alert')) !== true) return
+  const now = await $.clock.now()
+  const seen = ((await $.store.get('alarms')) as Record<string, number> | undefined) ?? {}
+  const k = `${kind}:${kind === 'budget' ? '' : s.sid}`
+  if (now - (seen[k] ?? 0) < ALARM_GAP_MS) return
+  const kept: Record<string, number> = {}
+  for (const [key, at] of Object.entries(seen)) if (now - at < 24 * 3_600_000) kept[key] = at
+  kept[k] = now
+  await $.store.set('alarms', kept)
+  await alert($, s, `⚠️ ${title}`, message)
+}
+
+// What keepwarm spent today on requests nobody asked for.
+async function autoSpendToday($: EngineInterface, now: number): Promise<number> {
+  const from = dayStart(now)
+  const log = ((await $.store.get('audit')) as Array<{ at: number; kind: string; usd?: number; manual?: boolean }> | undefined) ?? []
+  return log.reduce((a, r) => a + (r.at >= from && r.kind === 'request' && !r.manual ? r.usd ?? 0 : 0), 0)
+}
+
+async function overBudget($: EngineInterface): Promise<boolean> {
+  return cfg.dailyBudgetUsd > 0 && (await $.store.get('budgetHit')) === dayStart(await $.clock.now())
+}
+
+async function checkBudget($: EngineInterface, s: State) {
+  if (!cfg.dailyBudgetUsd || (await overBudget($))) return
+  const now = await $.clock.now()
+  const spent = await autoSpendToday($, now)
+  if (spent <= cfg.dailyBudgetUsd) return
+  await $.store.set('budgetHit', dayStart(now))
+  await audit($, s, 'change', '今日自动花费超过上限', { spent, budget: cfg.dailyBudgetUsd })
+  const msg = `keepwarm 今天自己花了 ${fmtUsd(spent)}（上限 $${cfg.dailyBudgetUsd}），午夜前空闲检查改为免费提醒；你开的保温照常。`
+  $.ui.toast(msg)
+  await alarm($, s, 'budget', '自动花费超过上限', msg)
+}
+
+async function alertLine($: EngineInterface, now: number): Promise<string> {
+  const on = (await $.store.get('alert')) === true
+  const spent = await autoSpendToday($, now)
+  const over = await overBudget($)
+  return `alerts      报警${on ? '开' : '关'}（/keepwarm alert on|off）· 今日自动花费 ${fmtUsd(spent)}${cfg.dailyBudgetUsd ? ` / 上限 $${cfg.dailyBudgetUsd}` : ''}${over ? '，已超，空闲检查改为免费提醒' : ''}`
+}
+
 // The desktop app names its sessions local_<uuid>; its deep link wants that id, and
 // its record maps it to the CLI session id this mod knows.
 const DESKTOP_SESSIONS = '$HOME/Library/Application Support/Claude/claude-code-sessions'
@@ -395,6 +456,11 @@ async function checkMiss($: EngineInterface, s: State, u: TurnUsage, prevAt: num
   s.misses.push(miss)
   await appendLog($, 'misses', { sid: s.sid, cwd: s.cwd, model: u.model, ...miss })
   if (!quiet) $.ui.toast(`冷写入 ${fmtTok(write)} tokens，约 ${fmtUsd(miss.usd)}（${MISS_ZH[cause]}）`)
+  if (cause === 'other') {
+    await alarm($, s, 'unexplained', '缓存被意外整段重写', `同一模型、距上次请求只有 ${fmtDuration(gapMs)}，仍整段重写了 ${fmtTok(write)} tokens（约 ${fmtUsd(miss.usd)}）。可能是系统提示或工具列表变了，或者回退、编辑了历史消息。`)
+  } else if (cause === 'expired' && s.deadline) {
+    await alarm($, s, 'lapsed', '保温期间缓存过期', `保温窗口开着，缓存还是过期了：重写 ${fmtTok(write)} tokens（约 ${fmtUsd(miss.usd)}）。看 /keepwarm log 找原因。`)
+  }
 }
 
 const hhmm = (ms: number) => new Date(ms).toTimeString().slice(0, 5)
@@ -406,6 +472,7 @@ async function lapsedWindow($: EngineInterface, s: State, deadline: number, caus
   const lostAt = s.lastRequestAt + TTL_MS
   const why = `保温本该到 ${hhmm(deadline)}，但${cause}，缓存约 ${hhmm(lostAt)} 已过期`
   await audit($, s, 'change', '保温中断', { why, deadline, lastRequestAt: s.lastRequestAt, lostAt })
+  await alarm($, s, 'lapsed', '保温失效', why)
   if (s.deadline) await stop($, s, why)
   else $.ui.toast(`keepwarm：${why}`)
 }
@@ -651,9 +718,15 @@ async function ping($: EngineInterface, s: State) {
     s.pending = $.clock.after(s.last.at + PING_MIN_GAP_MS - now, () => { void ping($, s) })
     return
   }
-  if (s.windowPings >= cfg.pingMaxPerWindow) return stop($, s, `这个保温窗口已 ping ${s.windowPings} 次，达到上限`)
-  s.windowPings += 1
-  const reply = await auditedFork($, s, s.wakePrompt ? '保温 ping（带唤醒判断）' : '保温 ping', s.wakePrompt ? wakeJudgePrompt(s, now) : PING_PROMPT)
+  const recent = (((await $.store.get('pings')) as Array<{ sid: string; at: number }> | undefined) ?? [])
+    .filter(p => p.sid === s.sid && now - p.at < cfg.pingLimitHours * 3_600_000).length
+  if (recent >= cfg.pingLimit) {
+    const why = `${cfg.pingLimitHours} 小时内已 ping ${recent} 次，达到上限 ${cfg.pingLimit}`
+    await alarm($, s, 'pinglimit', 'ping 次数到了上限', `${why}，保温已停。正常每 55 分钟一次，到上限多半是哪里出了问题，看 /keepwarm log。`)
+    return stop($, s, why)
+  }
+  const reply = await auditedFork($, s, s.wakePrompt ? '保温 ping（带唤醒判断）' : '保温 ping', s.wakePrompt ? wakeJudgePrompt(s, now) : PING_PROMPT, s.owner === 'user')
+  if (s.owner !== 'user') await checkBudget($, s)
   if (!reply.isAnswered && reply.reason === 'nothing-to-fork') return stop($, s, '没有可以 fork 的对话')
   if (!reply.isAnswered && reply.reason !== 'empty-reply') return stop($, s, `ping 失败（${reply.reason}）`)
   const u = reply.usage
@@ -726,7 +799,6 @@ async function startWindow($: EngineInterface, s: State, windowMs: number, owner
   s.reason = reason
   s.wakePrompt = wakePrompt
   s.stopped = null
-  s.windowPings = 0
   await audit($, s, 'change', '开启保温', { by: owner, owner: s.owner, until: s.deadline, reason, wake: wakePrompt || undefined, sticky: s.sticky })
   await save($, s)
   await arm($, s)
@@ -800,7 +872,7 @@ async function leaveCheck($: EngineInterface, s: State, hours: number, machineOn
   disarmCheck(s)
   const keepUsd = machineOn ? (hourUsd(s) ?? 0) * hours || null : null
   const compactUsd = compactNowUsd(s)
-  const reply = await auditedFork($, s, `离开判断（${hours}h，${machineOn ? '开机' : '关机'}）`, leavePrompt(s, hours, machineOn, keepUsd, compactUsd))
+  const reply = await auditedFork($, s, `离开判断（${hours}h，${machineOn ? '开机' : '关机'}）`, leavePrompt(s, hours, machineOn, keepUsd, compactUsd), true)
   let judgeUsd: number | null = null
   let v = null as ReturnType<typeof parseVerdict>
   if (reply.isAnswered) {
@@ -897,14 +969,15 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     await startWindow($, s, DEFAULT_WINDOW_MS, 'user', '项目策略：总是保温')
     return
   }
-  if (s.idle === 'notify' && !forced) {
+  if ((s.idle === 'notify' || (await overBudget($))) && !forced) {
     // No model call: just say the cache is about to lapse and what that costs.
     const left = fmtDuration(TTL_MS - (now - s.lastRequestAt))
     const msg = `缓存约 ${left} 后过期。上下文 ${fmtTok(s.ctx)}，过期后重写约 ${fmtUsd(coldUsd(s))}，保温约 ${fmtUsd(hourUsd(s))}/h`
     await alert($, s, '缓存快过期', msg)
     return arm($, s)
   }
-  const reply = await auditedFork($, s, forced ? '空闲判断（手动 check）' : '空闲判断（50 分钟）', judgePrompt(s, now - s.lastRequestAt))
+  const reply = await auditedFork($, s, forced ? '空闲判断（手动 check）' : '空闲判断（50 分钟）', judgePrompt(s, now - s.lastRequestAt), forced)
+  if (!forced) await checkBudget($, s)
   if (!reply.isAnswered) {
     if (reply.reason !== 'nothing-to-fork') $.ui.log(`keepwarm 空闲检查没有得到回答（${reply.reason}）`)
     return arm($, s)
@@ -940,12 +1013,14 @@ export const register: Register = (on, options) => {
   cfg.ntfyConfigFile = typeof options.ntfyConfigFile === 'string' ? options.ntfyConfigFile.trim() : ''
   cfg.remindMinCtx = num(options.remindMinContext, cfg.remindMinCtx)
   cfg.awayIdleS = num(options.awayMinutes, cfg.awayIdleS / 60) * 60
-  cfg.pingMaxPerWindow = num(options.pingMaxPerWindow, cfg.pingMaxPerWindow)
+  cfg.pingLimit = num(options.pingLimit, cfg.pingLimit)
+  cfg.pingLimitHours = num(options.pingLimitHours, cfg.pingLimitHours) || cfg.pingLimitHours
+  cfg.dailyBudgetUsd = num(options.dailyBudgetUsd, cfg.dailyBudgetUsd)
   const idle = options.idleCheck
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
     sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
-    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, windowPings: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
+    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
     last: null, pings: 0, pingUsd: 0, stopped: null,
   }
 
@@ -995,8 +1070,8 @@ export const register: Register = (on, options) => {
     s.lastModel = await $.session.model()
     await $.command.register({
       name: 'keepwarm',
-      description: '缓存保温与空闲提醒：on 3h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | log | policy ask|auto|warm|off',
-      argumentHint: '[on 3h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | log | policy ask|auto|warm|off]',
+      description: '缓存保温与空闲提醒：on 8h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | alert on/off | log | policy ask|auto|warm|off',
+      argumentHint: '[on 8h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | alert on/off | log | policy ask|auto|warm|off]',
       immediate: true,
     })
     await $.tool.register({
@@ -1149,6 +1224,19 @@ export const register: Register = (on, options) => {
       await arm($, s)
       return { text: { off: '空闲检查已关：50 分钟时什么都不做', notify: '空闲检查改为只提醒：50 分钟时免费通知一下缓存快过期，不调用模型', judge: '空闲检查改为判断：50 分钟时 fork 一次（约 $0.03）给出 compact/保温/不管 建议' }[v] }
     }
+    if (cmd === 'alert') {
+      const v = words[1]
+      if (v === 'test') {
+        await alert($, s, '⚠️ 测试报警', '这是一条测试报警：能看到它，说明 Mac 通知可用；离开电脑时同样的报警会推到手机。')
+        return { text: '已发出一条测试报警（Mac 通知；你离开电脑超过设定时间时才推到手机）' }
+      }
+      if (v !== 'on' && v !== 'off') return { text: `${await alertLine($, now)}\n用法：/keepwarm alert on|off|test（所有会话）` }
+      await $.store.set('alert', v === 'on')
+      await audit($, s, 'change', '改设置', { key: 'alert', value: v === 'on' })
+      return { text: v === 'on'
+        ? '报警已开（所有会话）：保温失效、缓存被意外整段重写、ping 次数到上限、自动花费超过上限时，发 Mac 通知（你离开电脑时也推到手机）；同一类每个会话一小时最多一次。普通的过期（你隔几小时才回来）不报。'
+        : '报警已关' }
+    }
     if (cmd === 'guard') {
       const g = words[1]
       if (g !== 'refuse' && g !== 'warn' && g !== 'off') return { text: '用法：/keepwarm guard refuse|warn|off' }
@@ -1188,7 +1276,7 @@ export const register: Register = (on, options) => {
       await startWindow($, s, ms, 'user', '手动开启', '', true)
       return { text: `保温开启 ${fmtDuration(s.deadline - now)}：这段时间里缓存不会过期，不管会话在干活、等后台任务还是等你；你发消息也不会取消，/keepwarm off 关。闲着时约 ${fmtUsd(hourUsd(s))}/小时（过期重写一次约 ${fmtUsd(coldUsd(s))}）` }
     }
-    return { text: card(s, now) }
+    return { text: `${card(s, now)}\n${await alertLine($, now)}` }
   })
 
   on('prompt.submit', async ($, e, next) => {

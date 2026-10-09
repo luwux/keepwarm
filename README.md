@@ -21,7 +21,12 @@ each session and speaks up *before* the hour runs out.
   work, or waiting on you. Only `/keepwarm off` ends it: your messages do not (while you work, your
   own requests keep the cache warm and nothing is sent). A window opened from a reminder's button or
   by the model covers an absence, so it ends when you write in that session.
-  Capped by `pingMaxPerWindow`.
+  At most `pingLimit` pings per session in any `pingLimitHours` (15 in 12 hours by default).
+- **Alerts** (`/keepwarm alert on`, off by default): a Mac notification (and a phone push when you
+  are away) only for what should not happen: a window whose pings could not go out, the cache
+  rewritten within the hour on the same model, the ping limit reached, or keepwarm's own daily
+  budget for requests you did not ask for (`dailyBudgetUsd`, $3) exceeded, after which the idle
+  check falls back to the free notice until midnight. At most one per kind and session an hour.
 - **Leaving**: `/keepwarm leave 2h` asks every live, warm session for its own verdict and
   shows one summary.
 - **Never blocks** a prompt unless you turn `guard refuse` on.
@@ -49,7 +54,8 @@ claude plugin install keepwarm
 ```
 
 Settings live in `/config` (or `pluginConfigs.keepwarm.options` in `~/.claude/settings.json`):
-`idleCheck` (notify | judge | off), `remindMinContext`, `pingMaxPerWindow`, `awayMinutes`,
+`idleCheck` (notify | judge | off), `remindMinContext`, `pingLimit`, `pingLimitHours`,
+`dailyBudgetUsd`, `awayMinutes`,
 `ntfyConfigFile` (a JSON file `{"server": "https://ntfy.sh", "topic": "…"}` for read-only phone
 notifications; empty disables them). Desktop notifications use
 [terminal-notifier](https://github.com/julienXX/terminal-notifier) when it is installed.
