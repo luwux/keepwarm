@@ -94,6 +94,10 @@ type State = {
   reason: string
   wakePrompt: string
   userOff: boolean
+  // Opened with /keepwarm on: it holds for its hours whatever the person does, and only
+  // /keepwarm off ends it. A window from a reminder or the model covers an absence, so it ends
+  // when the person writes.
+  sticky: boolean
   lastRequestAt: number
   lastModel: string | null
   ctx: number
@@ -181,7 +185,7 @@ function card(s: State, now: number): string {
     `context     ${s.ctx.toLocaleString('en-US')} / ${s.window.toLocaleString('en-US')} tokens`,
     `cache       ${!s.lastRequestAt ? '本会话还没有请求' : s.compacted ? '刚 compact，等下一轮' : isCold(s, now) ? `已冷（${fmtDuration(now - s.lastRequestAt)} 前最后请求）` : `热，还剩 ${fmtDuration(s.lastRequestAt + TTL_MS - now)}`}`,
     `cold cost   过期后重写一次 ≈ ${fmtUsd(coldUsd(s))}；保温 ≈ ${fmtUsd(hourUsd(s))}/小时`,
-    `keepwarm    ${s.deadline ? `开（${s.owner === 'model' ? '模型' : '你'}开的${s.reason ? `：${s.reason}` : ''}${s.wakePrompt ? `；唤醒任务：${s.wakePrompt}` : ''}），剩 ${fmtDuration(s.deadline - now)}` : s.stopped ? `停：${s.stopped}` : '关'}${s.userOff ? '；你已禁止模型开启' : ''}`,
+    `keepwarm    ${s.deadline ? `开（${s.sticky ? '/keepwarm on 开的，发消息不会结束，/keepwarm off 关' : `${s.owner === 'model' ? '模型' : '你'}开的，你回来发消息就结束`}${s.reason ? `：${s.reason}` : ''}${s.wakePrompt ? `；唤醒任务：${s.wakePrompt}` : ''}），剩 ${fmtDuration(s.deadline - now)}` : s.stopped ? `停：${s.stopped}` : '关'}${s.userOff ? '；你已禁止模型开启' : ''}`,
     `reminder    ${s.policy === 'off' ? '关' : s.check ? `空闲 ${fmtDuration(CHECK_AFTER_MS)} 时检查` : `未排程（需上下文 ≥ ${fmtTok(cfg.remindMinCtx)} 且无保温）`}`,
     `config      空闲检查 ${s.idle}（默认 ${cfg.idleDefault}）· 提醒门槛 ${fmtTok(cfg.remindMinCtx)} · 每窗口最多 ping ${cfg.pingMaxPerWindow} 次 · 手机推送${cfg.ntfyConfigFile ? `开（离开 ${cfg.awayIdleS / 60} 分钟后）` : '关'}`,
     `guard       ${{ refuse: '冷发送先拦一次（再发即通过）', warn: '不拦，冷写入只记账', off: '关' }[s.guard]}`,
@@ -429,8 +433,9 @@ async function save($: EngineInterface, s: State) {
     await $.store.set(key(s, 'owner'), s.owner ?? 'user')
     await $.store.set(key(s, 'reason'), s.reason)
     await $.store.set(key(s, 'wake'), s.wakePrompt)
+    await $.store.set(key(s, 'sticky'), s.sticky)
   } else {
-    for (const k of ['deadline', 'owner', 'reason', 'wake']) await $.store.delete(key(s, k))
+    for (const k of ['deadline', 'owner', 'reason', 'wake', 'sticky']) await $.store.delete(key(s, k))
   }
   if (s.userOff) await $.store.set(key(s, 'userOff'), true)
   else await $.store.delete(key(s, 'userOff'))
@@ -442,6 +447,7 @@ async function stop($: EngineInterface, s: State, why: string | null) {
   s.owner = null
   s.reason = ''
   s.wakePrompt = ''
+  s.sticky = false
   s.stopped = why
   disarm(s)
   stopCaffeinate($, s)
@@ -706,7 +712,7 @@ async function wakeDecision($: EngineInterface, s: State, text: string, now: num
   }
 }
 
-async function startWindow($: EngineInterface, s: State, windowMs: number, owner: Owner, reason: string, wakePrompt = '') {
+async function startWindow($: EngineInterface, s: State, windowMs: number, owner: Owner, reason: string, wakePrompt = '', sticky = false) {
   const now = await $.clock.now()
   const deadline = now + Math.min(windowMs, MAX_WINDOW_MS)
   // The model may extend the person's window, never shorten it.
@@ -715,12 +721,13 @@ async function startWindow($: EngineInterface, s: State, windowMs: number, owner
   } else {
     s.deadline = deadline
     s.owner = owner
+    s.sticky = sticky
   }
   s.reason = reason
   s.wakePrompt = wakePrompt
   s.stopped = null
   s.windowPings = 0
-  await audit($, s, 'change', '开启保温', { by: owner, owner: s.owner, until: s.deadline, reason, wake: wakePrompt || undefined })
+  await audit($, s, 'change', '开启保温', { by: owner, owner: s.owner, until: s.deadline, reason, wake: wakePrompt || undefined, sticky: s.sticky })
   await save($, s)
   await arm($, s)
 }
@@ -937,7 +944,7 @@ export const register: Register = (on, options) => {
   const idle = options.idleCheck
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
-    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false,
+    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
     lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, windowPings: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
     last: null, pings: 0, pingUsd: 0, stopped: null,
   }
@@ -953,8 +960,9 @@ export const register: Register = (on, options) => {
       s.owner = ((await $.store.get(key(s, 'owner'))) as Owner | undefined) ?? 'user'
       s.reason = ((await $.store.get(key(s, 'reason'))) as string | undefined) ?? ''
       s.wakePrompt = ((await $.store.get(key(s, 'wake'))) as string | undefined) ?? ''
+      s.sticky = (await $.store.get(key(s, 'sticky'))) === true
     } else if (saved !== undefined) {
-      for (const k of ['deadline', 'owner', 'reason', 'wake']) await $.store.delete(key(s, k))
+      for (const k of ['deadline', 'owner', 'reason', 'wake', 'sticky']) await $.store.delete(key(s, k))
     }
     s.userOff = (await $.store.get(key(s, 'userOff'))) === true
     await expireAdvice($, s) // a reminder left over from before a reload or restart
@@ -1177,7 +1185,7 @@ export const register: Register = (on, options) => {
       }
       s.every = every
       s.userOff = false
-      await startWindow($, s, ms, 'user', '手动开启')
+      await startWindow($, s, ms, 'user', '手动开启', '', true)
       return { text: `保温开启 ${fmtDuration(s.deadline - now)}：这段时间里缓存不会过期，不管会话在干活、等后台任务还是等你；你发消息也不会取消，/keepwarm off 关。闲着时约 ${fmtUsd(hourUsd(s))}/小时（过期重写一次约 ${fmtUsd(coldUsd(s))}）` }
     }
     return { text: card(s, now) }
@@ -1190,10 +1198,10 @@ export const register: Register = (on, options) => {
       if (a) await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: a.ctx, advised: a.action, reason: a.reason, chosen: 'returned', by: 'user' })
       await update($, advice, () => null)
     }
-    // The person is back: the absence the model guessed at is over; it may start a new window
-    // itself. A window the person opened runs its hours whatever they do: while they work their
-    // own requests keep the cache warm and no ping goes out, so it costs nothing until they stop.
-    if (e.origin.kind !== 'plugin' && s.deadline && s.owner === 'model' && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) {
+    // The person is back: the absence a reminder's or the model's window covered is over. A
+    // window opened with /keepwarm on runs its hours whatever they do (while they work their own
+    // requests keep the cache warm and no ping goes out); only /keepwarm off ends it.
+    if (e.origin.kind !== 'plugin' && s.deadline && !s.sticky && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) {
       await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: s.ctx, advised: 'keepwarm', reason: s.reason, chosen: 'returned-stop', by: 'user' })
       await stop($, s, null)
       s.stopped = null
