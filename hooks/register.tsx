@@ -183,23 +183,58 @@ function statusText(s: State, now: number): string | undefined {
   return `${cache} · 保温（${who}）剩 ${fmtDuration(s.deadline - now)} · ${fmtDuration(s.lastRequestAt + s.every - now)} 后 ping${last}`
 }
 
-function card(s: State, now: number): string {
+// Each label is two Chinese characters and a full-width space, so the lines stay aligned in the
+// desktop app's proportional font as well as in a terminal.
+async function card($: EngineInterface, s: State, now: number): Promise<string> {
+  const alertOn = (await $.store.get('alert')) === true
+  const spent = await spendToday($, now)
+  const over = await overBudget($)
+  const cache = !s.lastRequestAt ? '本会话还没有请求'
+    : s.compacted ? '刚 compact，等下一轮'
+    : isCold(s, now) ? `已冷（最后请求在 ${fmtDuration(now - s.lastRequestAt)} 前）`
+    : `热，还剩 ${fmtDuration(s.lastRequestAt + TTL_MS - now)}`
+  const warm = s.deadline
+    ? `开，还剩 ${fmtDuration(s.deadline - now)}（${s.sticky ? '/keepwarm on 开的，发消息不会结束' : `${s.owner === 'model' ? '模型' : '你'}开的，你回来发消息就结束`}）` +
+      `${s.reason && !s.sticky ? `：${s.reason}` : ''}${s.wakePrompt ? `；唤醒任务：${s.wakePrompt}` : ''}`
+    : s.stopped ? `关（上次停止：${s.stopped}）` : '关'
+  const remind = s.policy === 'off' || s.idle === 'off' ? '关'
+    : s.check ? `空闲 50 分钟时${s.idle === 'judge' && !over ? '判断一次（compact、保温还是不管）' : '免费提醒一次'}`
+    : s.deadline ? '保温期间不提醒'
+    : `不提醒（上下文不到 ${fmtTok(cfg.remindMinCtx)}，或缓存已冷）`
+  const missUsd = s.misses.reduce((a, m) => a + (m.usd ?? 0), 0)
   return [
-    `project     ${project(s)}（策略 ${s.policy}）`,
-    `model       ${s.lastModel ?? '尚未看到'}`,
-    `context     ${s.ctx.toLocaleString('en-US')} / ${s.window.toLocaleString('en-US')} tokens`,
-    `cache       ${!s.lastRequestAt ? '本会话还没有请求' : s.compacted ? '刚 compact，等下一轮' : isCold(s, now) ? `已冷（${fmtDuration(now - s.lastRequestAt)} 前最后请求）` : `热，还剩 ${fmtDuration(s.lastRequestAt + TTL_MS - now)}`}`,
-    `cold cost   过期后重写一次 ≈ ${fmtUsd(coldUsd(s))}；保温 ≈ ${fmtUsd(hourUsd(s))}/小时`,
-    `keepwarm    ${s.deadline ? `开（${s.sticky ? '/keepwarm on 开的，发消息不会结束，/keepwarm off 关' : `${s.owner === 'model' ? '模型' : '你'}开的，你回来发消息就结束`}${s.reason ? `：${s.reason}` : ''}${s.wakePrompt ? `；唤醒任务：${s.wakePrompt}` : ''}），剩 ${fmtDuration(s.deadline - now)}` : s.stopped ? `停：${s.stopped}` : '关'}${s.userOff ? '；你已禁止模型开启' : ''}`,
-    `reminder    ${s.policy === 'off' ? '关' : s.check ? `空闲 ${fmtDuration(CHECK_AFTER_MS)} 时检查` : `未排程（需上下文 ≥ ${fmtTok(cfg.remindMinCtx)} 且无保温）`}`,
-    `config      空闲检查 ${s.idle}（默认 ${cfg.idleDefault}）· 提醒门槛 ${fmtTok(cfg.remindMinCtx)} · 每会话 ${cfg.pingLimitHours} 小时内最多 ping ${cfg.pingLimit} 次 · 自动花费上限 ${cfg.dailyBudgetUsd ? `$${cfg.dailyBudgetUsd}/天` : '不限'} · 手机推送${cfg.ntfyConfigFile ? `开（离开 ${cfg.awayIdleS / 60} 分钟后）` : '关'}`,
-    `guard       ${{ refuse: '冷发送先拦一次（再发即通过）', warn: '不拦，冷写入只记账', off: '关' }[s.guard]}`,
-    `cold paid   本会话冷写入 ${s.misses.length} 次，${fmtUsd(s.misses.reduce((a, m) => a + (m.usd ?? 0), 0))}`,
-    `this run    ping ${s.pings} 次，合计 ${fmtUsd(s.pingUsd)}${s.last ? `；上次读 ${fmtTok(s.last.read)} 写 ${fmtTok(s.last.write)}` : ''}`,
+    `keepwarm · ${project(s)}`,
     '',
-    '/keepwarm on 8h | off | auto | status | check | leave 2h on|off | idle off|notify|judge | alert on|off | log | policy ask|auto|warm|off | guard refuse|warn|off | ledger',
+    `缓存　${cache} · 上下文 ${fmtTok(s.ctx)} / ${fmtTok(s.window)} · ${s.lastModel ?? '模型未知'}`,
+    `保温　${warm}${s.userOff ? '；你已禁止模型开启' : ''}`,
+    `提醒　${remind}`,
+    `价格　过期后重写一次约 ${fmtUsd(coldUsd(s))}，保温约 ${fmtUsd(hourUsd(s))}/小时`,
+    `记账　本会话冷写入 ${s.misses.length} 次 ${fmtUsd(missUsd)} · 本次运行 ping ${s.pings} 次 ${fmtUsd(s.pingUsd)}` +
+      `${s.last ? `（上次读 ${fmtTok(s.last.read)}、写 ${fmtTok(s.last.write)}）` : ''}`,
+    `今天　keepwarm 共花 ${fmtUsd(spent.auto + spent.manual)}：自己主动的 ${fmtUsd(spent.auto)}` +
+      `${cfg.dailyBudgetUsd ? `（上限 $${cfg.dailyBudgetUsd}${over ? '，已超，改为免费提醒' : ''}）` : ''}，你要求的 ${fmtUsd(spent.manual)}`,
+    `报警　${alertOn ? '开' : '关'}`,
+    `设置　空闲检查 ${s.idle} · 提醒门槛 ${fmtTok(cfg.remindMinCtx)} · ping 上限 ${cfg.pingLimit} 次/${cfg.pingLimitHours} 小时 · ` +
+      `冷发送${{ refuse: '先拦一次', warn: '只记账', off: '不管' }[s.guard]} · 项目策略 ${s.policy} · 手机推送${cfg.ntfyConfigFile ? `开（离开 ${cfg.awayIdleS / 60} 分钟后）` : '关'}`,
+    '',
+    '常用　/keepwarm on 8h · off · check · alert on · log · help',
   ].join('\n')
 }
+
+const HELP = [
+  '/keepwarm 的用法',
+  '',
+  'on 8h：保温 8 小时（也可以写 90m），不管会话在干什么、你发什么消息，只有 off 能关',
+  'off：关掉保温，并禁止模型自己开；auto：重新允许模型自己开',
+  'status：看状态（直接输入 /keepwarm 也是）',
+  'check：现在判断一次：compact、保温还是不管',
+  'leave 2h on|off：告诉所有会话你要离开多久（on 电脑开着，off 合盖或关机）',
+  'idle off|notify|judge：空闲 50 分钟时什么都不做 / 免费提醒 / 判断一次',
+  'alert on|off|test：报警开关；test 发一条测试报警',
+  'policy ask|auto|warm|off：本项目空闲时问你 / 自动照办 / 总是保温 / 不管',
+  'guard refuse|warn|off：缓存已冷还发消息时先拦一次 / 只记账 / 不管',
+  'log [all] [requests|changes]：审计记录；ledger：冷写入账本',
+].join('\n')
 
 // ---------- audit: every request keepwarm pays for and every change it makes ----------
 // All side effects go through the audited* helpers below; nothing else calls $.model, $.mcp,
@@ -1077,8 +1112,8 @@ export const register: Register = (on, options) => {
     s.lastModel = await $.session.model()
     await $.command.register({
       name: 'keepwarm',
-      description: '缓存保温与空闲提醒：on 8h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | alert on/off | log | policy ask|auto|warm|off',
-      argumentHint: '[on 8h | off | auto | status | check | leave 2h on/off | idle off/notify/judge | alert on/off | log | policy ask|auto|warm|off]',
+      description: '缓存保温与空闲提醒：on 8h | off | check | alert on/off | status | help（全部用法）',
+      argumentHint: '[on 8h | off | check | alert on|off | status | help]',
       immediate: true,
     })
     await $.tool.register({
@@ -1148,7 +1183,7 @@ export const register: Register = (on, options) => {
     const input = e as unknown as { action?: string; hours?: unknown; reason?: unknown; wake_prompt?: unknown }
     const now = await $.clock.now()
     const reason = typeof input.reason === 'string' ? input.reason.slice(0, 120) : ''
-    if (input.action === 'status') return { result: card(s, now) }
+    if (input.action === 'status') return { result: await card($, s, now) }
     if (input.action === 'stop') {
       if (s.owner === 'user' && s.deadline) return { result: `The user started this window themselves (${fmtDuration(s.deadline - now)} left); leave it, or tell them they can /keepwarm off.` }
       if (!s.deadline) return { result: 'keepwarm was already off.' }
@@ -1168,6 +1203,7 @@ export const register: Register = (on, options) => {
     const words = String(e.args ?? '').trim().split(/\s+/).filter(Boolean)
     const now = await $.clock.now()
     const cmd = words[0] ?? 'status'
+    if (cmd === 'help') return { text: HELP }
     if (cmd === 'off') {
       s.userOff = true
       await audit($, s, 'change', '改设置', { key: 'userOff', value: true })
@@ -1283,7 +1319,7 @@ export const register: Register = (on, options) => {
       await startWindow($, s, ms, 'user', '手动开启', '', true)
       return { text: `保温开启 ${fmtDuration(s.deadline - now)}：这段时间里缓存不会过期，不管会话在干活、等后台任务还是等你；你发消息也不会取消，/keepwarm off 关。闲着时约 ${fmtUsd(hourUsd(s))}/小时（过期重写一次约 ${fmtUsd(coldUsd(s))}）` }
     }
-    return { text: `${card(s, now)}\n${await alertLine($, now)}` }
+    return { text: await card($, s, now) }
   })
 
   on('prompt.submit', async ($, e, next) => {
