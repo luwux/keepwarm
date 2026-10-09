@@ -1,6 +1,6 @@
 {
   "name": "keepwarm",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Idle-session guard for Claude Code's 1-hour prompt cache (macOS): about 50 idle minutes after the last turn of a large session it notifies you, optionally after a cache-read fork judges whether to compact, keep warm or leave it; every request and change it makes is audited. Derived from cache-tax (MIT, Karan Bansal).",
   "author": {
     "name": "luwux"

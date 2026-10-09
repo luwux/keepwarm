@@ -203,7 +203,7 @@ async function card($: EngineInterface, s: State, now: number): Promise<string> 
     : `不提醒（上下文不到 ${fmtTok(cfg.remindMinCtx)}，或缓存已冷）`
   const missUsd = s.misses.reduce((a, m) => a + (m.usd ?? 0), 0)
   return [
-    `keepwarm · ${project(s)}`,
+    `${project(s)}（项目策略 ${s.policy}）`,
     '',
     `缓存　${cache} · 上下文 ${fmtTok(s.ctx)} / ${fmtTok(s.window)} · ${s.lastModel ?? '模型未知'}`,
     `保温　${warm}${s.userOff ? '；你已禁止模型开启' : ''}`,
