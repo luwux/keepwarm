@@ -12,7 +12,7 @@
 //
 // Keep-warm is derived from cache-tax (MIT, Karan Bansal, github.com/karanb192/cache-tax).
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, TurnUsage } from 'claude-code'
 
 import type { KeepwarmAdvice, KeepwarmLeaveAll, KeepwarmLeaveItem } from '../types'
 
@@ -62,7 +62,10 @@ const PRICES: Array<[string, number, number, number]> = [
 type Owner = 'user' | 'model'
 type Policy = 'ask' | 'auto' | 'warm' | 'off'
 type Guard = 'refuse' | 'warn' | 'off'
-type Miss = { at: number; tokens: number; usd: number | null }
+// Why a request rewrote the cache: the hour lapsed, the model changed, or something else
+// changed the prompt's prefix (system prompt, tool list).
+type MissCause = 'expired' | 'model' | 'other'
+type Miss = { at: number; tokens: number; usd: number | null; cause: MissCause; gapMs: number }
 type Usage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
 type PingRecord = { at: number; read: number; write: number; usd: number | null; warm: boolean }
 type Timer = { cancel: () => void }
@@ -73,7 +76,14 @@ type State = {
   policy: Policy
   guard: Guard
   ackedAt: number
-  coldPending: boolean
+  // What the last main-loop request carried, and on which model: the next one is held to it.
+  stepCtx: number
+  stepModel: string | null
+  // The first request after a compaction writes the summary; that is not a miss.
+  skipMiss: boolean
+  // The first request after this process started: a real miss is logged without a toast, since
+  // opening a cold session already said so.
+  quietMiss: boolean
   misses: Miss[]
   deadline: number
   every: number
@@ -273,6 +283,18 @@ async function auditedCompact($: EngineInterface, s: State, instructions: string
   }
 }
 
+// A slash command run as the user would type it (the desktop app compacts only this way).
+async function auditedCommand($: EngineInterface, s: State, purpose: string, command: string, args: string) {
+  try {
+    const r = await $.command.run({ command, args })
+    await audit($, s, 'change', purpose, { command, args: args.slice(0, 500), text: r.text?.slice(0, 300), compacted: s.compacted })
+    return r
+  } catch (err) {
+    await audit($, s, 'change', purpose, { command, args: args.slice(0, 500), ok: false, error: errText(err) })
+    throw err
+  }
+}
+
 async function appendLog($: EngineInterface, name: string, row: Record<string, unknown>) {
   const log = ((await $.store.get(name)) as unknown[] | undefined) ?? []
   log.push(row)
@@ -336,6 +358,49 @@ function guardText(s: State, now: number): string {
   const warm = p ? s.ctx * p[0] / 1e6 : null
   return `缓存已冷 ${fmtDuration(now - s.lastRequestAt - TTL_MS)}（最后请求在 ${fmtDuration(now - s.lastRequestAt)} 前）。` +
     `这次发送要重写约 ${fmtTok(s.ctx)} tokens，约 ${fmtUsd(coldUsd(s))}（热的话只要 ${fmtUsd(warm)}）。`
+}
+
+const MISS_ZH = { expired: '缓存过期', model: '换了模型', other: '提示前缀变了' } as const
+
+// Judged per request, not per turn: a long turn whose context grows step by step writes a lot
+// in total and is not a miss, while a rewrite in the middle of a turn (after a foreground
+// subagent that ran past the hour) is one.
+async function checkMiss($: EngineInterface, s: State, u: TurnUsage, prevAt: number) {
+  const prev = s.stepCtx || s.ctx
+  const read = u.cache_read_input_tokens
+  const write = u.cache_creation_input_tokens
+  const prevModel = s.stepModel ?? s.lastModel
+  s.stepCtx = read + write + u.input_tokens
+  s.stepModel = u.model
+  const quiet = s.quietMiss
+  s.quietMiss = false
+  // Nothing was cached yet (a new session's first message), or the summary of a compaction.
+  if (!prevAt || s.skipMiss) {
+    s.skipMiss = false
+    return
+  }
+  if (prev <= 20000 || read >= 0.5 * prev || write < 0.5 * prev) return
+  const now = await $.clock.now()
+  const gapMs = prevAt ? now - prevAt : 0
+  const cause: MissCause = prevModel && prevModel !== u.model ? 'model' : gapMs > TTL_MS ? 'expired' : 'other'
+  const p = priceOf(u.model)
+  const miss: Miss = { at: now, tokens: write, usd: p ? write * p[1] / 1e6 : null, cause, gapMs }
+  s.misses.push(miss)
+  await appendLog($, 'misses', { sid: s.sid, cwd: s.cwd, model: u.model, ...miss })
+  if (!quiet) $.ui.toast(`冷写入 ${fmtTok(write)} tokens，约 ${fmtUsd(miss.usd)}（${MISS_ZH[cause]}）`)
+}
+
+const hhmm = (ms: number) => new Date(ms).toTimeString().slice(0, 5)
+
+// A window whose pings could not go out (the Mac slept, or this session's process was not
+// running after an app restart): the cache lapsed an hour after the last request, inside the
+// window. Record it and end the window rather than let it run out silently.
+async function lapsedWindow($: EngineInterface, s: State, deadline: number, cause: string) {
+  const lostAt = s.lastRequestAt + TTL_MS
+  const why = `保温本该到 ${hhmm(deadline)}，但${cause}，缓存约 ${hhmm(lostAt)} 已过期`
+  await audit($, s, 'change', '保温中断', { why, deadline, lastRequestAt: s.lastRequestAt, lostAt })
+  if (s.deadline) await stop($, s, why)
+  else $.ui.toast(`keepwarm：${why}`)
 }
 
 async function missesTotal($: EngineInterface): Promise<{ n: number; usd: number }> {
@@ -572,7 +637,7 @@ async function ping($: EngineInterface, s: State) {
   const now = await $.clock.now()
   if (now >= s.deadline) return arm($, s)
   if (now - s.lastRequestAt < s.every - 1000) return arm($, s) // a turn re-armed meanwhile
-  if (isCold(s, now)) return arm($, s)
+  if (isCold(s, now)) return lapsedWindow($, s, s.deadline, '电脑睡眠或进程暂停超过 1 小时，ping 没能按时发出')
   if (s.last && now - s.last.at < PING_MIN_GAP_MS) {
     s.pending = $.clock.after(s.last.at + PING_MIN_GAP_MS - now, () => { void ping($, s) })
     return
@@ -773,13 +838,20 @@ async function apply($: EngineInterface, s: State, a: KeepwarmAdvice, choice: Ke
     try {
       await auditedCompact($, s, a.instructions)
     } catch {
-      // Headless hosts (the desktop app, the SDK) compact inside a turn: send /compact as a prompt.
+      // Headless hosts (the desktop app, the SDK) refuse a direct compaction and refuse a prompt
+      // that starts with "/": run the /compact command itself. The clipboard stays as the last
+      // resort, also when the command returned but no compaction followed.
+      let failed = ''
       try {
-        await auditedSubmit($, s, 'compact（以 /compact 消息提交）', command)
+        await auditedCommand($, s, 'compact（以 /compact 命令执行）', 'compact', a.instructions)
+        if (!s.compacted) failed = '命令已执行，但没有看到压缩发生'
       } catch (err) {
+        failed = errText(err)
+      }
+      if (failed) {
         const copied = await $.ui.copy({ text: command }).catch(() => ({ isCopied: false }))
         await audit($, s, 'change', '复制 /compact 命令到剪贴板', { copied: copied.isCopied })
-        $.ui.toast(`compact 没能自动执行（${err instanceof Error ? err.message : String(err)}）。${copied.isCopied ? '命令已复制，' : ''}请在输入框发送：${command}`)
+        $.ui.toast(`compact 没能自动执行（${failed}）。${copied.isCopied ? '命令已复制，' : ''}请在输入框发送：${command}`)
       }
     }
   } else if (choice === 'keepwarm') {
@@ -862,7 +934,7 @@ export const register: Register = (on, options) => {
   const idle = options.idleCheck
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
-    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, coldPending: false, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false,
+    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false,
     lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, windowPings: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
     last: null, pings: 0, pingUsd: 0, stopped: null,
   }
@@ -884,6 +956,11 @@ export const register: Register = (on, options) => {
     s.userOff = (await $.store.get(key(s, 'userOff'))) === true
     await expireAdvice($, s) // a reminder left over from before a reload or restart
     await loadRuntime($, s, now)
+    // The desktop app starts a session's process only when the session is opened, so after an
+    // app restart (an update installs itself while the Mac is idle) no ping went out meanwhile.
+    if (typeof saved === 'number' && s.lastRequestAt && saved > s.lastRequestAt + TTL_MS && isCold(s, now)) {
+      await lapsedWindow($, s, saved, '这个会话的进程中途没在运行（app 重启或退出后，会话要打开才会重新启动）')
+    }
     const seen = await busGet<LeaveReq>($, 'leave-req')
     if (seen) s.leaveSeen = seen.id // a request from before this process is not for it
     if (s.tick) s.tick.cancel()
@@ -952,7 +1029,8 @@ export const register: Register = (on, options) => {
       s.turnAt = 0
       s.compacted = false
       s.ackedAt = 0
-      s.coldPending = false
+      s.stepCtx = 0
+      s.skipMiss = false
       s.misses = []
       s.sid = await $.session.id()
       await update($, advice, () => null)
@@ -1119,14 +1197,10 @@ export const register: Register = (on, options) => {
     if (e.origin.kind === 'plugin' || typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
     const now = await $.clock.now()
     if (s.guard === 'off' || !isCold(s, now) || s.ctx < GUARD_MIN_CTX) return next(e)
-    if (s.guard === 'warn') {
-      s.coldPending = true
-      return next(e)
-    }
+    if (s.guard === 'warn') return next(e)
     // Refuse once per cold stretch; the resend goes through.
     if (s.ackedAt === s.lastRequestAt) {
       s.ackedAt = 0
-      s.coldPending = true
       return next(e)
     }
     s.ackedAt = s.lastRequestAt
@@ -1137,12 +1211,15 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     // Every model request of the main loop (a prompt or a tool result going back) reads and
     // refreshes the cache: restart the hour and redraw the footer now, not at turn end.
+    const before = s.lastRequestAt
     if (!e.agentId) {
       const now = await $.clock.now()
       s.turnAt = s.lastRequestAt = now
       $.ui.status(statusText(s, now))
     }
-    yield* next(e)
+    const res = yield* next(e)
+    if (!e.agentId && res.usage) await checkMiss($, s, res.usage, before)
+    return res
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -1153,18 +1230,8 @@ export const register: Register = (on, options) => {
     s.turnAt = s.lastRequestAt
     s.compacted = false
     if (e.usage?.model) s.lastModel = e.usage.model
-    const prev = s.ctx
     const usage = await $.session.usage()
     if (usage.context.tokens && usage.context.tokens > 0) s.ctx = usage.context.tokens
-    const write = e.usage?.cache_creation_input_tokens ?? 0
-    if (s.coldPending || (prev > 20000 && write >= 0.5 * prev)) {
-      const p = priceOf(s.lastModel)
-      const miss = { at: now, tokens: write, usd: p ? write * p[1] / 1e6 : null }
-      s.misses.push(miss)
-      await appendLog($, 'misses', { sid: s.sid, cwd: s.cwd, model: s.lastModel, ...miss })
-      $.ui.toast(`冷写入 ${fmtTok(write)} tokens，约 ${fmtUsd(miss.usd)}`)
-    }
-    s.coldPending = false
     s.ackedAt = 0
     s.window = usage.context.window
     await arm($, s)
@@ -1175,6 +1242,8 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     if (!e.agentId) {
       s.compacted = true
+      s.skipMiss = true
+      s.stepCtx = 0
       disarm(s)
       disarmCheck(s)
     }

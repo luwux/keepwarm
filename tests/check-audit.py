@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fails if keepwarm makes a request or a change that bypasses the audit layer.
 
-Every raw effectful call ($.model, $.mcp, $.prompt.submit, $.session.compact/append,
+Every raw effectful call ($.model, $.mcp, $.command.run, $.prompt.submit, $.session.compact/append,
 $.process.run/spawn, $.ui.copy) must sit inside an audited* helper, inside a function that
 only reads, or within a few lines of an explicit audit(...) call.
 """
@@ -9,8 +9,8 @@ import re, sys, pathlib
 
 src = pathlib.Path(__file__).resolve().parent.parent / 'hooks' / 'register.tsx'
 lines = src.read_text().splitlines()
-RAW = re.compile(r'\$\.(model\.(fork|complete)|mcp\.call|prompt\.submit|session\.(compact|append)|process\.(run|spawn)|ui\.copy)\(')
-AUDIT_LAYER = {'auditedFork', 'auditedComplete', 'auditedMcp', 'auditedRun', 'auditedSubmit', 'auditedCompact'}
+RAW = re.compile(r'\$\.(model\.(fork|complete)|mcp\.call|command\.run|prompt\.submit|session\.(compact|append)|process\.(run|spawn)|ui\.copy)\(')
+AUDIT_LAYER = {'auditedFork', 'auditedComplete', 'auditedMcp', 'auditedRun', 'auditedSubmit', 'auditedCompact', 'auditedCommand'}
 READ_ONLY = {'idleSeconds', 'desktopSession', 'busGet', 'busAll', 'ntfyConfig'}  # these only read
 FN = re.compile(r'^(?:export\s+)?(?:async\s+)?function\s+(\w+)')
 
