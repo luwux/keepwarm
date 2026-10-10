@@ -364,7 +364,8 @@ async function idleSeconds($: EngineInterface): Promise<number> {
 // A desktop notification always; the phone too when nobody is at the Mac.
 async function alert($: EngineInterface, s: State, title: string, message: string) {
   await notify($, s, title, message)
-  if ((await idleSeconds($)) >= cfg.awayIdleS) await push($, s, `${project(s)} · ${title}`, message + '\n\n要处理请回到会话里。')
+  // The phone shows the session's own title (as the desktop sidebar does), not the folder.
+  if ((await idleSeconds($)) >= cfg.awayIdleS) await push($, s, `${(await desktopSession($, s))?.title || project(s)} · ${title}`, message + '\n\n要处理请回到会话里。')
 }
 
 // ---------- alerts: only what should not have happened, opt-in (/keepwarm alert on) ----------
@@ -1391,6 +1392,14 @@ export const register: Register = (on, options) => {
       disarm(s)
       disarmCheck(s)
     }
+    return r
+  })
+
+  // Probe: does the phone (Remote Control) ever join as the mobile surface? The band is not
+  // drawn there, a Pane is; this log decides whether advice buttons can reach the phone.
+  on('session.attach', async ($, e, next) => {
+    const r = await next(e)
+    await appendLog($, 'attaches', { sid: s.sid, at: await $.clock.now(), surface: e.surface, client: e.clientId, viewport: e.viewport ?? null }).catch(() => {})
     return r
   })
 
