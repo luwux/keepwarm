@@ -109,6 +109,7 @@ type State = {
   ctx: number
   window: number
   compacted: boolean
+  compactions: number // seen since this load: a command worked when it went up
   pending: Timer | null
   check: Timer | null
   expire: Timer | null
@@ -342,9 +343,10 @@ async function auditedCompact($: EngineInterface, s: State, instructions: string
 
 // A slash command run as the user would type it (the desktop app compacts only this way).
 async function auditedCommand($: EngineInterface, s: State, purpose: string, command: string, args: string) {
+  const n = s.compactions
   try {
     const r = await $.command.run({ command, args })
-    await audit($, s, 'change', purpose, { command, args: args.slice(0, 500), text: r.text?.slice(0, 300), compacted: s.compacted })
+    await audit($, s, 'change', purpose, { command, args: args.slice(0, 500), text: r.text?.slice(0, 300), compacted: s.compactions > n })
     return r
   } catch (err) {
     await audit($, s, 'change', purpose, { command, args: args.slice(0, 500), ok: false, error: errText(err) })
@@ -531,9 +533,11 @@ async function phoneDo($: EngineInterface, s: State, choice: PhoneChoice) {
   }
   if (choice.kind === 'compact') {
     const before = s.ctx
+    const n = s.compactions
     await apply($, s, a ?? { action: 'compact', reason: '手机通知上的 compact', topic: '', instructions: '', hours: 3, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: null, at: now, auto: false }, 'compact', 'user')
-    await push($, s, `${name} · ${s.compacted ? '已 compact' : 'compact 没成功'}`,
-      s.compacted ? `原来上下文 ${fmtTok(before)}，下一轮从摘要开始。` : '回到会话里手动 /compact。')
+    const done = s.compactions > n
+    await push($, s, `${name} · ${done ? '已 compact' : 'compact 没成功'}`,
+      done ? `原来上下文 ${fmtTok(before)}，下一轮从摘要开始。` : '回到会话里手动 /compact。')
     return
   }
   if (a) {
@@ -1144,9 +1148,10 @@ async function apply($: EngineInterface, s: State, a: KeepwarmAdvice, choice: Ke
       // that starts with "/": run the /compact command itself. The clipboard stays as the last
       // resort, also when the command returned but no compaction followed.
       let failed = ''
+      const n = s.compactions
       try {
         await auditedCommand($, s, 'compact（以 /compact 命令执行）', 'compact', a.instructions)
-        if (!s.compacted) failed = '命令已执行，但没有看到压缩发生'
+        if (s.compactions === n) failed = '命令已执行，但没有看到压缩发生'
       } catch (err) {
         failed = errText(err)
       }
@@ -1247,7 +1252,7 @@ export const register: Register = (on, options) => {
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
     sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
-    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
+    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, compactions: 0, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
     last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, phonePoll: null, phoneBusy: false,
   }
 
@@ -1556,6 +1561,8 @@ export const register: Register = (on, options) => {
     if (!e.agentId) {
       const now = await $.clock.now()
       s.turnAt = s.lastRequestAt = now
+      // The first request after a compaction writes the cache afresh: the hour runs again.
+      s.compacted = false
       $.ui.status(statusText(s, now))
     }
     const res = yield* next(e)
@@ -1584,6 +1591,7 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     if (!e.agentId) {
       s.compacted = true
+      s.compactions++
       s.skipMiss = true
       s.stepCtx = 0
       disarm(s)
