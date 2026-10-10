@@ -27,6 +27,11 @@ each session and speaks up *before* the hour runs out.
   rewritten within the hour on the same model, the ping limit reached, or keepwarm's own daily
   budget for requests you did not ask for (`dailyBudgetUsd`, $3) exceeded, after which the idle
   check falls back to the free notice until midnight. At most one per kind and session an hour.
+- **Button panel** (`/keepwarm panel`): the cache countdown, the window, the pending advice and
+  buttons to compact, keep warm 8 hours (as `/keepwarm on 8h`), stop keeping warm or close. The
+  band above the prompt is not drawn on the phone, so when the Claude app on the phone opens the
+  session (Remote Control), or a reminder arrives while it is open, the panel opens by itself, and
+  it closes again when the phone leaves. The phone push is titled with the session's own title.
 - **Leaving**: `/keepwarm leave 2h` asks every live, warm session for its own verdict and
   shows one summary.
 - **Never blocks** a prompt unless you turn `guard refuse` on.

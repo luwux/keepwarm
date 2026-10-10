@@ -38,6 +38,7 @@ export type KeepwarmLeaveAll = {
 
 declare module 'claude-code' {
   interface PluginState {
-    keepwarm: { advice: KeepwarmAdvice | null; leaveAll: KeepwarmLeaveAll | null }
+    // panel: a counter bumped to redraw the panel (its countdown, a window started or stopped).
+    keepwarm: { advice: KeepwarmAdvice | null; leaveAll: KeepwarmLeaveAll | null; panel: number }
   }
 }

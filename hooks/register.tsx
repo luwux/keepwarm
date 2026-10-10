@@ -128,10 +128,15 @@ type State = {
   pings: number
   pingUsd: number
   stopped: string | null
+  // The panel: redraws its countdown each minute while open; opened for a phone, it closes when
+  // the last phone leaves.
+  paneTick: Timer | null
+  paneForPhone: boolean
 }
 
 const advice = atom({ plugin: 'keepwarm', key: 'advice' } as const, null as KeepwarmAdvice | null)
 const leaveAll = atom({ plugin: 'keepwarm', key: 'leaveAll' } as const, null as KeepwarmLeaveAll | null)
+const panel = atom({ plugin: 'keepwarm', key: 'panel' } as const, 0)
 
 type LeaveReq = { id: string; at: number; from: string; hours: number; machineOn: boolean }
 type Runtime = { lastRequestAt: number; turnAt: number; ctx: number; window: number; model: string | null; compacted: boolean }
@@ -234,6 +239,7 @@ const HELP = [
   'policy ask|auto|warm|off：本项目空闲时问你 / 自动照办 / 总是保温 / 不管',
   'guard refuse|warn|off：缓存已冷还发消息时先拦一次 / 只记账 / 不管',
   'log [all] [requests|changes]：审计记录；ledger：冷写入账本',
+  'panel：打开按钮面板（compact / 保温 / 关保温）；手机打开会话时会自己弹出',
 ].join('\n')
 
 // ---------- audit: every request keepwarm pays for and every change it makes ----------
@@ -366,6 +372,48 @@ async function alert($: EngineInterface, s: State, title: string, message: strin
   await notify($, s, title, message)
   // The phone shows the session's own title (as the desktop sidebar does), not the folder.
   if ((await idleSeconds($)) >= cfg.awayIdleS) await push($, s, `${(await desktopSession($, s))?.title || project(s)} · ${title}`, message + '\n\n要处理请回到会话里。')
+}
+
+// ---------- the panel: the same buttons as the band, in a pane, which the phone also draws ----------
+
+const PANE = 'keepwarm'
+
+async function openPanel($: EngineInterface, s: State, why: 'phone' | 'advice' | 'command', forPhone = false) {
+  const r = await $.ui.open({ id: PANE, title: 'keepwarm' })
+  await appendLog($, 'attaches', { sid: s.sid, at: await $.clock.now(), event: 'open', why, placed: r.isPlaced, reason: r.isPlaced ? null : r.reason }).catch(() => {})
+  s.paneForPhone = forPhone
+  // The countdown moves with the clock, not with any value the drawing reads.
+  if (s.paneTick) s.paneTick.cancel()
+  s.paneTick = $.clock.every(60_000, () => { void update($, panel, n => n + 1) })
+  return r
+}
+
+type PanelChoice = 'compact' | 'advised' | 'warm8' | 'off' | 'ignore'
+
+async function panelPress($: EngineInterface, s: State, choice: PanelChoice) {
+  const now = await $.clock.now()
+  const stored = await read($, advice)
+  const a = stored && !adviceStale(stored, now) ? stored : null
+  await audit($, s, 'change', '面板按钮', { choice, advised: a?.action ?? null })
+  if (choice === 'compact') {
+    await apply($, s, a ?? { action: 'compact', reason: '面板上手动 compact', topic: '', instructions: '', hours: 3, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: null, at: now, auto: false }, 'compact', 'user')
+  } else if (choice === 'advised' && a) {
+    await apply($, s, a, 'keepwarm', 'user')
+  } else if (choice === 'ignore' && a) {
+    await apply($, s, a, 'ignore', 'user')
+  } else if (choice === 'warm8') {
+    // The same as /keepwarm on 8h: it holds whatever happens, until off.
+    if (a) {
+      await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: a.action, reason: a.reason, chosen: 'keepwarm', by: 'user' })
+      await update($, advice, () => null)
+    }
+    s.userOff = false
+    await startWindow($, s, 8 * 3_600_000, 'user', '面板：保温 8h', '', true)
+  } else if (choice === 'off') {
+    await stop($, s, '你在面板上关了保温')
+  }
+  $.ui.status(statusText(s, await $.clock.now()))
+  await update($, panel, n => n + 1)
 }
 
 // ---------- alerts: only what should not have happened, opt-in (/keepwarm alert on) ----------
@@ -696,8 +744,7 @@ async function poll($: EngineInterface, s: State) {
   await busSet($, s, `leave-res-${s.sid}`, { id: req.id, sid: s.sid, project: project(s), topic: a.topic ?? '', ctx: a.ctx, action: a.action, reason: a.reason, keepUsd: L?.keepUsd ?? null, compactUsd: L?.compactUsd ?? null, coldUsd: a.coldUsd })
   // The advice waits in this session's own band; acting on it is done here, by hand.
   if (a.action !== 'ignore') {
-    await update($, advice, () => a)
-    await expireAdvice($, s)
+    await offerAdvice($, s, a)
   }
 }
 
@@ -745,8 +792,7 @@ async function endWarn($: EngineInterface, s: State) {
     action: 'keepwarm', topic: '', reason: `保温约 ${fmtDuration(s.deadline - now)} 后结束，之后缓存会在 1 小时内过期。要续的话选保温`,
     instructions: '', hours: DEFAULT_WINDOW_MS / 3_600_000, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: 0, at: now, auto: false,
   }
-  await update($, advice, () => a)
-  await expireAdvice($, s)
+  await offerAdvice($, s, a)
   await alert($, s, '保温快结束了', `${a.reason}（上下文 ${fmtTok(s.ctx)}，过期重写 ${fmtUsd(coldUsd(s))}）`)
 }
 
@@ -989,6 +1035,14 @@ async function apply($: EngineInterface, s: State, a: KeepwarmAdvice, choice: Ke
 // The judge fork wrote or read the whole prefix at a.at, so that is when the hour starts.
 const adviceStale = (a: KeepwarmAdvice, now: number) => now - a.at >= TTL_MS - 1000
 
+// A new reminder goes to the band above the prompt, and to the panel when a phone is attached:
+// the band is not drawn on the phone, a pane is.
+async function offerAdvice($: EngineInterface, s: State, a: KeepwarmAdvice) {
+  await update($, advice, () => a)
+  await expireAdvice($, s)
+  if ((await $.session.surfaces()).includes('mobile')) await openPanel($, s, 'advice', true).catch(err => $.ui.log(`keepwarm：面板打开失败 ${errText(err)}`, { to: 'debug' }))
+}
+
 async function expireAdvice($: EngineInterface, s: State) {
   if (s.expire) s.expire.cancel()
   s.expire = null
@@ -1037,8 +1091,7 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     await notify($, s, `已自动${label.replace('建议', '')}`, a.reason)
     await apply($, s, a, a.action, 'auto')
   } else if (a.action !== 'ignore') {
-    await update($, advice, () => a)
-    await expireAdvice($, s)
+    await offerAdvice($, s, a)
     await alert($, s, label, `${a.topic ? `${a.topic}：` : ''}${a.reason}（上下文 ${fmtTok(a.ctx)}，过期重写 ${fmtUsd(a.coldUsd)}）`)
   } else {
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: 'ignore', reason: a.reason, chosen: 'ignore', by: 'auto' })
@@ -1064,7 +1117,7 @@ export const register: Register = (on, options) => {
   const s: State = {
     sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
     lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
-    last: null, pings: 0, pingUsd: 0, stopped: null,
+    last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, paneForPhone: false,
   }
 
   on('session.start', async ($, e, next) => {
@@ -1113,8 +1166,8 @@ export const register: Register = (on, options) => {
     s.lastModel = await $.session.model()
     await $.command.register({
       name: 'keepwarm',
-      description: '缓存保温与空闲提醒：on 8h | off | check | alert on/off | status | help（全部用法）',
-      argumentHint: '[on 8h | off | check | alert on|off | status | help]',
+      description: '缓存保温与空闲提醒：on 8h | off | check | panel | alert on/off | status | help（全部用法）',
+      argumentHint: '[on 8h | off | check | panel | alert on|off | status | help]',
       immediate: true,
     })
     await $.tool.register({
@@ -1205,6 +1258,10 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     const cmd = words[0] ?? 'status'
     if (cmd === 'help') return { text: HELP }
+    if (cmd === 'panel') {
+      const r = await openPanel($, s, 'command')
+      return { text: r.isPlaced ? '按钮面板已打开' : `面板已打开但还没显示（${r.reason}）` }
+    }
     if (cmd === 'off') {
       s.userOff = true
       await audit($, s, 'change', '改设置', { key: 'userOff', value: true })
@@ -1395,12 +1452,65 @@ export const register: Register = (on, options) => {
     return r
   })
 
-  // Probe: does the phone (Remote Control) ever join as the mobile surface? The band is not
-  // drawn there, a Pane is; this log decides whether advice buttons can reach the phone.
+  // The phone joins as the mobile surface. The band above the prompt is not drawn there, a pane
+  // is, so the buttons come up in the panel. The log says how each attach and open went.
   on('session.attach', async ($, e, next) => {
     const r = await next(e)
-    await appendLog($, 'attaches', { sid: s.sid, at: await $.clock.now(), surface: e.surface, client: e.clientId, viewport: e.viewport ?? null }).catch(() => {})
+    await appendLog($, 'attaches', { sid: s.sid, at: await $.clock.now(), event: 'attach', surface: e.surface, client: e.clientId, viewport: e.viewport ?? null }).catch(() => {})
+    if (e.surface === 'mobile' && s.lastRequestAt) await openPanel($, s, 'phone', true).catch(err => $.ui.log(`keepwarm：面板打开失败 ${errText(err)}`, { to: 'debug' }))
     return r
+  })
+
+  on('session.detach', async ($, e, next) => {
+    const r = await next(e)
+    await appendLog($, 'attaches', { sid: s.sid, at: await $.clock.now(), event: 'detach', surface: e.surface, client: e.clientId, why: e.reason }).catch(() => {})
+    if (e.surface === 'mobile' && e.reason !== 'end' && s.paneForPhone && !(await $.session.surfaces()).includes('mobile')) {
+      await $.ui.close({ id: PANE }).catch(() => {})
+    }
+    return r
+  })
+
+  on('ui.close', async ($, e, next) => {
+    const r = await next(e)
+    if (e.id === PANE) {
+      if (s.paneTick) s.paneTick.cancel()
+      s.paneTick = null
+      s.paneForPhone = false
+    }
+    return r
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    await read($, panel)
+    const now = await $.clock.now()
+    const stored = await read($, advice)
+    const a = stored && !adviceStale(stored, now) ? stored : null
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const warm = s.lastRequestAt > 0 && !s.compacted && !isCold(s, now)
+    const cache = !s.lastRequestAt ? '本会话还没有请求'
+      : s.compacted ? '刚 compact，下一轮会从摘要开始'
+      : isCold(s, now) ? `缓存已过期 ${fmtDuration(now - s.lastRequestAt - TTL_MS)}`
+      : `缓存还剩 ${fmtDuration(s.lastRequestAt + TTL_MS - now)}`
+    const win = s.deadline
+      ? `保温中，还剩 ${fmtDuration(s.deadline - now)}（${s.sticky ? '发消息不会结束' : '你回来发消息就结束'}）`
+      : s.stopped ? `保温已停：${s.stopped}` : '没在保温'
+    const head = a ? { compact: '建议 compact', keepwarm: `建议保温 ${a.hours}h`, ignore: '建议不管' }[a.action] : null
+    return (
+      <Box flexDirection="column">
+        <Text bold>{cache}</Text>
+        <Text>{win}</Text>
+        {s.ctx > 0 && <Text dimColor>上下文 {fmtTok(s.ctx)} · 过期重写 {fmtUsd(coldUsd(s))} · 保温 {fmtUsd(hourUsd(s))}/h</Text>}
+        {a && <Text><Text bold>{head}</Text>：{a.reason}</Text>}
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
+          {s.lastRequestAt > 0 && !s.compacted && <Button key="compact" hotkey="1" label="compact" variant={a?.action === 'compact' ? 'primary' : undefined} onPress={() => panelPress($, s, 'compact')} />}
+          {warm && a?.action === 'keepwarm' && a.hours !== 8 && <Button key="advised" hotkey="2" label={`保温 ${a.hours}h`} variant="primary" onPress={() => panelPress($, s, 'advised')} />}
+          {warm && <Button key="warm8" hotkey="3" label={s.deadline ? '续到 8h' : '保温 8h'} onPress={() => panelPress($, s, 'warm8')} />}
+          {s.deadline > 0 && <Button key="off" hotkey="4" label="关保温" onPress={() => panelPress($, s, 'off')} />}
+          {a && <Button key="ignore" hotkey="5" label="不管" onPress={() => panelPress($, s, 'ignore')} />}
+          <Button key="close" hotkey="0" label="收起" role="dismiss" onPress={() => { void $.ui.close({ id: PANE }) }} />
+        </Box>
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
