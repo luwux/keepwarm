@@ -73,7 +73,7 @@ type Policy = 'ask' | 'auto' | 'warm' | 'off'
 type Guard = 'refuse' | 'warn' | 'off'
 // Why a request rewrote the cache: the hour lapsed, the model changed, or something else
 // changed the prompt's prefix (system prompt, tool list).
-type MissCause = 'expired' | 'model' | 'reload' | 'other'
+type MissCause = 'expired' | 'model' | 'other'
 type Miss = { at: number; tokens: number; usd: number | null; cause: MissCause; gapMs: number }
 type Usage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
 type PingRecord = { at: number; read: number; write: number; usd: number | null; warm: boolean }
@@ -93,9 +93,6 @@ type State = {
   // The first request after this process started: a real miss is logged without a toast, since
   // opening a cold session already said so.
   quietMiss: boolean
-  // This module was reloaded (/reload-plugins) into a running session: the reload changes the
-  // prompt (the tools and plugin listings), so the next request rewrites the cache.
-  reloaded: boolean
   misses: Miss[]
   deadline: number
   every: number
@@ -652,7 +649,7 @@ function guardText(s: State, now: number): string {
     `这次发送要重写约 ${fmtTok(s.ctx)} tokens，约 ${fmtUsd(coldUsd(s))}（热的话只要 ${fmtUsd(warm)}）。`
 }
 
-const MISS_ZH = { expired: '缓存过期', model: '换了模型', reload: '重载了插件', other: '提示前缀变了' } as const
+const MISS_ZH = { expired: '缓存过期', model: '换了模型', other: '提示前缀变了' } as const
 
 // Judged per request, not per turn: a long turn whose context grows step by step writes a lot
 // in total and is not a miss, while a rewrite in the middle of a turn (after a foreground
@@ -666,8 +663,6 @@ async function checkMiss($: EngineInterface, s: State, u: TurnUsage, prevAt: num
   s.stepModel = u.model
   const quiet = s.quietMiss
   s.quietMiss = false
-  const reloaded = s.reloaded
-  s.reloaded = false
   // Nothing was cached yet (a new session's first message), or the summary of a compaction.
   if (!prevAt || s.skipMiss) {
     s.skipMiss = false
@@ -676,7 +671,7 @@ async function checkMiss($: EngineInterface, s: State, u: TurnUsage, prevAt: num
   if (prev <= 20000 || read >= 0.5 * prev || write < 0.5 * prev) return
   const now = await $.clock.now()
   const gapMs = prevAt ? now - prevAt : 0
-  const cause: MissCause = prevModel && prevModel !== u.model ? 'model' : gapMs > TTL_MS ? 'expired' : reloaded ? 'reload' : 'other'
+  const cause: MissCause = prevModel && prevModel !== u.model ? 'model' : gapMs > TTL_MS ? 'expired' : 'other'
   const p = priceOf(u.model)
   const miss: Miss = { at: now, tokens: write, usd: p ? write * p[1] / 1e6 : null, cause, gapMs }
   s.misses.push(miss)
@@ -1251,7 +1246,7 @@ export const register: Register = (on, options) => {
   const idle = options.idleCheck
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
-    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, reloaded: false, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
+    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
     lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
     last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, phonePoll: null, phoneBusy: false,
   }
@@ -1298,8 +1293,6 @@ export const register: Register = (on, options) => {
     const guard = await $.store.get('guard')
     s.guard = guard === 'refuse' || guard === 'off' ? guard : 'warn' // never block unless asked to
     const usage = await $.session.usage()
-    // A session that began well before this module loaded is a reload, not a start.
-    s.reloaded = now - usage.startedAt > 60_000
     if (usage.context.tokens) s.ctx = usage.context.tokens
     s.window = usage.context.window
     s.lastModel = await $.session.model()
