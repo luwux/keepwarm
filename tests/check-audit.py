@@ -11,7 +11,7 @@ src = pathlib.Path(__file__).resolve().parent.parent / 'hooks' / 'register.tsx'
 lines = src.read_text().splitlines()
 RAW = re.compile(r'\$\.(model\.(fork|complete)|mcp\.call|command\.run|prompt\.submit|session\.(compact|append)|process\.(run|spawn)|ui\.copy)\(')
 AUDIT_LAYER = {'auditedFork', 'auditedComplete', 'auditedMcp', 'auditedRun', 'auditedSubmit', 'auditedCompact', 'auditedCommand'}
-READ_ONLY = {'idleSeconds', 'desktopSession', 'busGet', 'busAll', 'ntfyConfig'}  # these only read
+READ_ONLY = {'idleSeconds', 'desktopSession', 'busGet', 'busAll', 'ntfyConfig', 'readReplies'}  # these only read
 FN = re.compile(r'^(?:export\s+)?(?:async\s+)?function\s+(\w+)')
 
 fn = None
@@ -29,9 +29,9 @@ for i, line in enumerate(lines):
         continue
     bad.append(f'{src.name}:{i + 1} in {fn}(): {line.strip()}')
 
-for name in READ_ONLY:  # a read-only helper must not grow a write
+for name in READ_ONLY:  # a read-only helper must not grow a write (a GET with curl is a read)
     body = re.search(rf'function {name}\(.*?\n}}\n', '\n'.join(lines), re.S)
-    if body and re.search(r'>\s*"|\bmv\b|\brm\b|-delete|mkdir|curl|terminal-notifier', body.group(0)):
+    if body and re.search(r'''>\s*"|\bmv\b|\brm\b|-delete|mkdir|terminal-notifier|curl.*'(-d|--data|-X|-T)'.*''', body.group(0)):
         bad.append(f'{name}() is listed read-only but looks like it writes')
 
 if bad:

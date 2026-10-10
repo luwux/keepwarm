@@ -27,11 +27,13 @@ each session and speaks up *before* the hour runs out.
   rewritten within the hour on the same model, the ping limit reached, or keepwarm's own daily
   budget for requests you did not ask for (`dailyBudgetUsd`, $3) exceeded, after which the idle
   check falls back to the free notice until midnight. At most one per kind and session an hour.
-- **Button panel** (`/keepwarm panel`): the cache countdown, the window, the pending advice and
-  buttons to compact, keep warm 8 hours (as `/keepwarm on 8h`), stop keeping warm or close. The
-  band above the prompt is not drawn on the phone, so when the Claude app on the phone opens the
-  session (Remote Control), or a reminder arrives while it is open, the panel opens by itself, and
-  it closes again when the phone leaves. The phone push is titled with the session's own title.
+- **Buttons on the phone**: when you are away, a reminder pushed to the phone (ntfy) carries
+  buttons: compact, keep warm N hours, leave it (or extend, when a window is about to end). A tap
+  posts a one-time token to `reply_topic` from the ntfy config; the session polls that topic every
+  20 seconds while it has buttons out, does what was tapped and pushes a confirmation. A token
+  works for its own session only, once per notification, for 3 hours; a tap after the cache has
+  lapsed is answered and not acted on. `/keepwarm push` sends a test. The push is titled with the
+  session's own title. `/keepwarm panel` shows the same buttons in a pane on the Mac.
 - **Leaving**: `/keepwarm leave 2h` asks every live, warm session for its own verdict and
   shows one summary.
 - **Never blocks** a prompt unless you turn `guard refuse` on.
@@ -61,8 +63,8 @@ claude plugin install keepwarm
 Settings live in `/config` (or `pluginConfigs.keepwarm.options` in `~/.claude/settings.json`):
 `idleCheck` (notify | judge | off), `remindMinContext`, `pingLimit`, `pingLimitHours`,
 `dailyBudgetUsd`, `awayMinutes`,
-`ntfyConfigFile` (a JSON file `{"server": "https://ntfy.sh", "topic": "…"}` for read-only phone
-notifications; empty disables them). Desktop notifications use
+`ntfyConfigFile` (a JSON file `{"server": "https://ntfy.sh", "topic": "…", "reply_topic": "…"}`
+for phone notifications, with buttons when `reply_topic` is set; empty disables them). Desktop notifications use
 [terminal-notifier](https://github.com/julienXX/terminal-notifier) when it is installed.
 
 The interface text is Chinese for now.

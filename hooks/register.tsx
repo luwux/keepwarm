@@ -128,10 +128,11 @@ type State = {
   pings: number
   pingUsd: number
   stopped: string | null
-  // The panel: redraws its countdown each minute while open; opened for a phone, it closes when
-  // the last phone leaves.
+  // The panel (/keepwarm panel) redraws its countdown each minute while open.
   paneTick: Timer | null
-  paneForPhone: boolean
+  // Buttons on a phone push: polling the reply topic while one of them may still be tapped.
+  phonePoll: Timer | null
+  phoneBusy: boolean
 }
 
 const advice = atom({ plugin: 'keepwarm', key: 'advice' } as const, null as KeepwarmAdvice | null)
@@ -239,7 +240,8 @@ const HELP = [
   'policy ask|auto|warm|off：本项目空闲时问你 / 自动照办 / 总是保温 / 不管',
   'guard refuse|warn|off：缓存已冷还发消息时先拦一次 / 只记账 / 不管',
   'log [all] [requests|changes]：审计记录；ledger：冷写入账本',
-  'panel：打开按钮面板（compact / 保温 / 关保温）；手机打开会话时会自己弹出',
+  'push：发一条带按钮的测试推送到手机（真实提醒在你离开 Mac 时才推，带 compact / 保温 / 不管 按钮）',
+  'panel：打开按钮面板（compact / 保温 / 关保温）',
 ].join('\n')
 
 // ---------- audit: every request keepwarm pays for and every change it makes ----------
@@ -368,20 +370,24 @@ async function idleSeconds($: EngineInterface): Promise<number> {
 }
 
 // A desktop notification always; the phone too when nobody is at the Mac.
-async function alert($: EngineInterface, s: State, title: string, message: string) {
+async function alert($: EngineInterface, s: State, title: string, message: string, buttons: PhoneButton[] = []) {
   await notify($, s, title, message)
+  if ((await idleSeconds($)) < cfg.awayIdleS) return
+  const c = await ntfyConfig($)
+  const actions = c ? await phoneActions($, s, buttons, c) : []
   // The phone shows the session's own title (as the desktop sidebar does), not the folder.
-  if ((await idleSeconds($)) >= cfg.awayIdleS) await push($, s, `${(await desktopSession($, s))?.title || project(s)} · ${title}`, message + '\n\n要处理请回到会话里。')
+  await push($, s, `${await sessionName($, s)} · ${title}`,
+    message + (actions.length ? '\n\n点下面的按钮，Mac 上的这个会话约半分钟内照做，做完再推一条确认。' : '\n\n要处理请回到会话里。'), actions)
 }
 
-// ---------- the panel: the same buttons as the band, in a pane, which the phone also draws ----------
+const sessionName = async ($: EngineInterface, s: State) => (await desktopSession($, s))?.title || project(s)
+
+// ---------- the panel (/keepwarm panel): the same buttons as the band, in a pane ----------
 
 const PANE = 'keepwarm'
 
-async function openPanel($: EngineInterface, s: State, why: 'phone' | 'advice' | 'command', forPhone = false) {
+async function openPanel($: EngineInterface, s: State) {
   const r = await $.ui.open({ id: PANE, title: 'keepwarm' })
-  await appendLog($, 'attaches', { sid: s.sid, at: await $.clock.now(), event: 'open', why, placed: r.isPlaced, reason: r.isPlaced ? null : r.reason }).catch(() => {})
-  s.paneForPhone = forPhone
   // The countdown moves with the clock, not with any value the drawing reads.
   if (s.paneTick) s.paneTick.cancel()
   s.paneTick = $.clock.every(60_000, () => { void update($, panel, n => n + 1) })
@@ -414,6 +420,130 @@ async function panelPress($: EngineInterface, s: State, choice: PanelChoice) {
   }
   $.ui.status(statusText(s, await $.clock.now()))
   await update($, panel, n => n + 1)
+}
+
+// ---------- buttons on a phone push ----------
+// Each button is an ntfy http action that posts a one-time token to the reply topic. Only this
+// session honours its tokens, each notification once (one tap spends all its buttons), and only
+// for PHONE_KEEP_MS; the session polls the topic (a GET) while any of its tokens is live.
+
+type PhoneChoice = { kind: 'compact' } | { kind: 'warm'; hours: number } | { kind: 'ignore' }
+type PhoneButton = { label: string; choice: PhoneChoice }
+type PhoneToken = { token: string; group: string; choice: PhoneChoice; at: number; exp: number }
+type NtfyAction = { action: 'http'; label: string; url: string; method: 'POST'; body: string; clear: true }
+
+const PHONE_POLL_MS = 20_000
+const PHONE_KEEP_MS = 3 * 3_600_000
+
+const warmButton = (hours: number, verb = '保温'): PhoneButton => ({ label: `${verb} ${hours}h`, choice: { kind: 'warm', hours } })
+const COMPACT_BUTTON: PhoneButton = { label: 'compact', choice: { kind: 'compact' } }
+const IGNORE_BUTTON: PhoneButton = { label: '不管', choice: { kind: 'ignore' } }
+
+async function phoneTokens($: EngineInterface, s: State): Promise<PhoneToken[]> {
+  const v = await $.store.get(key(s, 'phone'))
+  return Array.isArray(v) ? (v as PhoneToken[]) : []
+}
+
+async function setPhoneTokens($: EngineInterface, s: State, list: PhoneToken[]) {
+  if (list.length) await $.store.set(key(s, 'phone'), list)
+  else await $.store.delete(key(s, 'phone'))
+}
+
+async function phoneActions($: EngineInterface, s: State, buttons: PhoneButton[], c: Ntfy): Promise<NtfyAction[]> {
+  if (!c.reply || !buttons.length) return []
+  const now = await $.clock.now()
+  const group = crypto.randomUUID()
+  const fresh = buttons.slice(0, 3).map(b => ({ label: b.label, t: { token: crypto.randomUUID().replace(/-/g, ''), group, choice: b.choice, at: now, exp: now + PHONE_KEEP_MS } }))
+  await setPhoneTokens($, s, [...(await phoneTokens($, s)).filter(t => t.exp > now), ...fresh.map(f => f.t)])
+  armPhonePoll($, s)
+  return fresh.map(({ label, t }) => ({ action: 'http', label, url: `${c.server}/${c.reply}`, method: 'POST', body: JSON.stringify({ keepwarm: t.token }), clear: true }))
+}
+
+function armPhonePoll($: EngineInterface, s: State) {
+  if (!s.phonePoll) s.phonePoll = $.clock.every(PHONE_POLL_MS, () => { void pollPhone($, s) })
+}
+
+// The taps since the oldest live token was handed out: a GET on the reply topic, nothing written.
+async function readReplies($: EngineInterface, c: Ntfy, since: number): Promise<{ id: string; token: string }[]> {
+  const r = await $.process.run(['curl', '-s', '-m', '10', `${c.server}/${c.reply}/json?poll=1&since=${since}`])
+  const out: { id: string; token: string }[] = []
+  for (const line of r.stdout.split('\n')) {
+    try {
+      const m = JSON.parse(line) as { id?: string; event?: string; message?: string }
+      const b = JSON.parse(m.message ?? '') as { keepwarm?: unknown }
+      if (m.event === 'message' && m.id && typeof b.keepwarm === 'string') out.push({ id: m.id, token: b.keepwarm })
+    } catch {
+      // another sender's message on the topic, or a partial line
+    }
+  }
+  return out
+}
+
+async function pollPhone($: EngineInterface, s: State) {
+  if (s.phoneBusy) return
+  s.phoneBusy = true
+  try {
+    const now = await $.clock.now()
+    const live = (await phoneTokens($, s)).filter(t => t.exp > now)
+    if (!live.length) {
+      if (s.phonePoll) s.phonePoll.cancel()
+      s.phonePoll = null
+      await setPhoneTokens($, s, [])
+      return
+    }
+    const c = await ntfyConfig($)
+    if (!c?.reply) return
+    const since = Math.floor(Math.min(...live.map(t => t.at)) / 1000) - 5
+    for (const r of await readReplies($, c, since)) {
+      const tokens = await phoneTokens($, s)
+      const t = tokens.find(x => x.token === r.token && x.exp > now)
+      if (!t) continue
+      await setPhoneTokens($, s, tokens.filter(x => x.group !== t.group))
+      await phoneDo($, s, t.choice)
+    }
+  } catch (err) {
+    $.ui.log(`keepwarm：读手机按钮失败 ${errText(err)}`, { to: 'debug' })
+  } finally {
+    s.phoneBusy = false
+  }
+}
+
+async function phoneDo($: EngineInterface, s: State, choice: PhoneChoice) {
+  const now = await $.clock.now()
+  const stored = await read($, advice)
+  const a = stored && !adviceStale(stored, now) ? stored : null
+  await audit($, s, 'change', '手机通知按钮', { choice, advised: a?.action ?? null })
+  const name = await sessionName($, s)
+  if (choice.kind === 'ignore') {
+    if (a) await apply($, s, a, 'ignore', 'user')
+    return
+  }
+  if (s.compacted) {
+    await push($, s, `${name} · 已经 compact 过了`, '这次按钮没有执行。')
+    return
+  }
+  if (isCold(s, now)) {
+    const late = `缓存在 ${fmtDuration(now - s.lastRequestAt - TTL_MS)} 前已经过期，`
+    await push($, s, `${name} · 缓存已过期，没执行`, choice.kind === 'compact'
+      ? `${late}现在 compact 要重新读整段上下文（约 ${fmtUsd(coldUsd(s))}），回到会话里再决定。`
+      : `${late}保温已经没有意义。`)
+    return
+  }
+  if (choice.kind === 'compact') {
+    const before = s.ctx
+    await apply($, s, a ?? { action: 'compact', reason: '手机通知上的 compact', topic: '', instructions: '', hours: 3, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: null, at: now, auto: false }, 'compact', 'user')
+    await push($, s, `${name} · ${s.compacted ? '已 compact' : 'compact 没成功'}`,
+      s.compacted ? `原来上下文 ${fmtTok(before)}，下一轮从摘要开始。` : '回到会话里手动 /compact。')
+    return
+  }
+  if (a) {
+    await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: a.action, reason: a.reason, chosen: 'keepwarm', by: 'user' })
+    await update($, advice, () => null)
+  }
+  s.userOff = false
+  // Like a reminder's button: it covers the absence, so it ends when you write in the session.
+  await startWindow($, s, choice.hours * 3_600_000, 'user', `手机通知：保温 ${choice.hours}h`)
+  await push($, s, `${name} · 已保温 ${choice.hours}h`, `约 ${fmtUsd(hourUsd(s))}/小时；你回来在这个会话里发消息，保温就结束。`)
 }
 
 // ---------- alerts: only what should not have happened, opt-in (/keepwarm alert on) ----------
@@ -748,25 +878,26 @@ async function poll($: EngineInterface, s: State) {
   }
 }
 
-// ---------- phone (ntfy): read-only notifications, no buttons ----------
+// ---------- phone (ntfy): notifications, with buttons when a reply topic is set ----------
 
-type Ntfy = { server: string; topic: string }
+// reply_topic: where the buttons on a push post their one-time token; without it pushes carry none.
+type Ntfy = { server: string; topic: string; reply: string | null }
 
 async function ntfyConfig($: EngineInterface): Promise<Ntfy | null> {
   try {
     if (!cfg.ntfyConfigFile) return null
     const r = await $.process.run(['sh', '-c', 'f=$1; case $f in "~/"*) f="$HOME/${f#??}";; esac; cat "$f"', 'kw', cfg.ntfyConfigFile])
-    const c = JSON.parse(r.stdout) as Partial<Ntfy>
-    return c.server && c.topic ? { server: c.server.replace(/\/$/, ''), topic: c.topic } : null
+    const c = JSON.parse(r.stdout) as { server?: string; topic?: string; reply_topic?: string }
+    return c.server && c.topic ? { server: c.server.replace(/\/$/, ''), topic: c.topic, reply: c.reply_topic || null } : null
   } catch {
     return null
   }
 }
 
-async function push($: EngineInterface, s: State, title: string, markdown: string) {
+async function push($: EngineInterface, s: State, title: string, markdown: string, actions: NtfyAction[] = []) {
   const c = await ntfyConfig($)
   if (!c) return
-  const body = { topic: c.topic, title, message: markdown.slice(0, 4000), markdown: true, priority: 3, tags: ['hourglass'] }
+  const body = { topic: c.topic, title, message: markdown.slice(0, 4000), markdown: true, priority: 3, tags: ['hourglass'], ...(actions.length ? { actions } : {}) }
   try {
     await auditedRun($, s, 'notify', '手机推送', ['curl', '-s', '-m', '15', '-H', 'Content-Type: application/json', '-d', JSON.stringify(body), c.server + '/'], { title })
   } catch {
@@ -793,7 +924,7 @@ async function endWarn($: EngineInterface, s: State) {
     instructions: '', hours: DEFAULT_WINDOW_MS / 3_600_000, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: 0, at: now, auto: false,
   }
   await offerAdvice($, s, a)
-  await alert($, s, '保温快结束了', `${a.reason}（上下文 ${fmtTok(s.ctx)}，过期重写 ${fmtUsd(coldUsd(s))}）`)
+  await alert($, s, '保温快结束了', `${a.reason}（上下文 ${fmtTok(s.ctx)}，过期重写 ${fmtUsd(coldUsd(s))}）`, [warmButton(a.hours, '续'), IGNORE_BUTTON])
 }
 
 async function ping($: EngineInterface, s: State) {
@@ -1035,12 +1166,10 @@ async function apply($: EngineInterface, s: State, a: KeepwarmAdvice, choice: Ke
 // The judge fork wrote or read the whole prefix at a.at, so that is when the hour starts.
 const adviceStale = (a: KeepwarmAdvice, now: number) => now - a.at >= TTL_MS - 1000
 
-// A new reminder goes to the band above the prompt, and to the panel when a phone is attached:
-// the band is not drawn on the phone, a pane is.
+// A new reminder goes to the band above the prompt until the cache it is about lapses.
 async function offerAdvice($: EngineInterface, s: State, a: KeepwarmAdvice) {
   await update($, advice, () => a)
   await expireAdvice($, s)
-  if ((await $.session.surfaces()).includes('mobile')) await openPanel($, s, 'advice', true).catch(err => $.ui.log(`keepwarm：面板打开失败 ${errText(err)}`, { to: 'debug' }))
 }
 
 async function expireAdvice($: EngineInterface, s: State) {
@@ -1070,7 +1199,7 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     // No model call: just say the cache is about to lapse and what that costs.
     const left = fmtDuration(TTL_MS - (now - s.lastRequestAt))
     const msg = `缓存约 ${left} 后过期。上下文 ${fmtTok(s.ctx)}，过期后重写约 ${fmtUsd(coldUsd(s))}，保温约 ${fmtUsd(hourUsd(s))}/h`
-    await alert($, s, '缓存快过期', msg)
+    await alert($, s, '缓存快过期', msg, [warmButton(3), warmButton(8), COMPACT_BUTTON])
     return arm($, s)
   }
   const reply = await auditedFork($, s, forced ? '空闲判断（手动 check）' : '空闲判断（50 分钟）', judgePrompt(s, now - s.lastRequestAt), forced)
@@ -1092,7 +1221,9 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     await apply($, s, a, a.action, 'auto')
   } else if (a.action !== 'ignore') {
     await offerAdvice($, s, a)
-    await alert($, s, label, `${a.topic ? `${a.topic}：` : ''}${a.reason}（上下文 ${fmtTok(a.ctx)}，过期重写 ${fmtUsd(a.coldUsd)}）`)
+    const warm = warmButton(a.hours)
+    await alert($, s, label, `${a.topic ? `${a.topic}：` : ''}${a.reason}（上下文 ${fmtTok(a.ctx)}，过期重写 ${fmtUsd(a.coldUsd)}）`,
+      a.action === 'compact' ? [COMPACT_BUTTON, warm, IGNORE_BUTTON] : [warm, COMPACT_BUTTON, IGNORE_BUTTON])
   } else {
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: 'ignore', reason: a.reason, chosen: 'ignore', by: 'auto' })
   }
@@ -1117,7 +1248,7 @@ export const register: Register = (on, options) => {
   const s: State = {
     sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
     lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
-    last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, paneForPhone: false,
+    last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, phonePoll: null, phoneBusy: false,
   }
 
   on('session.start', async ($, e, next) => {
@@ -1137,6 +1268,7 @@ export const register: Register = (on, options) => {
     }
     s.userOff = (await $.store.get(key(s, 'userOff'))) === true
     await expireAdvice($, s) // a reminder left over from before a reload or restart
+    if ((await phoneTokens($, s)).some(t => t.exp > now)) armPhonePoll($, s) // buttons on a push still out
     await loadRuntime($, s, now)
     // The desktop app starts a session's process only when the session is opened, so after an
     // app restart (an update installs itself while the Mac is idle) no ping went out meanwhile.
@@ -1258,8 +1390,16 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     const cmd = words[0] ?? 'status'
     if (cmd === 'help') return { text: HELP }
+    if (cmd === 'push') {
+      const c = await ntfyConfig($)
+      if (!c) return { text: '没有配置手机推送（ntfyConfigFile）' }
+      if (!c.reply) return { text: '推送配置里没有 reply_topic，手机通知不会带按钮' }
+      const actions = await phoneActions($, s, [warmButton(1), IGNORE_BUTTON, COMPACT_BUTTON], c)
+      await push($, s, `${await sessionName($, s)} · 测试按钮`, '测试推送：点「保温 1h」，约半分钟内这个会话开始保温，并再推一条确认；「compact」会真的压缩这个会话。', actions)
+      return { text: '测试推送已发到手机。点按钮后约半分钟内这个会话照做，并再推一条确认（Mac 不用醒着看，但要开着、这个会话的进程要在）。' }
+    }
     if (cmd === 'panel') {
-      const r = await openPanel($, s, 'command')
+      const r = await openPanel($, s)
       return { text: r.isPlaced ? '按钮面板已打开' : `面板已打开但还没显示（${r.reason}）` }
     }
     if (cmd === 'off') {
@@ -1452,30 +1592,11 @@ export const register: Register = (on, options) => {
     return r
   })
 
-  // The phone joins as the mobile surface. The band above the prompt is not drawn there, a pane
-  // is, so the buttons come up in the panel. The log says how each attach and open went.
-  on('session.attach', async ($, e, next) => {
-    const r = await next(e)
-    await appendLog($, 'attaches', { sid: s.sid, at: await $.clock.now(), event: 'attach', surface: e.surface, client: e.clientId, viewport: e.viewport ?? null }).catch(() => {})
-    if (e.surface === 'mobile' && s.lastRequestAt) await openPanel($, s, 'phone', true).catch(err => $.ui.log(`keepwarm：面板打开失败 ${errText(err)}`, { to: 'debug' }))
-    return r
-  })
-
-  on('session.detach', async ($, e, next) => {
-    const r = await next(e)
-    await appendLog($, 'attaches', { sid: s.sid, at: await $.clock.now(), event: 'detach', surface: e.surface, client: e.clientId, why: e.reason }).catch(() => {})
-    if (e.surface === 'mobile' && e.reason !== 'end' && s.paneForPhone && !(await $.session.surfaces()).includes('mobile')) {
-      await $.ui.close({ id: PANE }).catch(() => {})
-    }
-    return r
-  })
-
   on('ui.close', async ($, e, next) => {
     const r = await next(e)
     if (e.id === PANE) {
       if (s.paneTick) s.paneTick.cancel()
       s.paneTick = null
-      s.paneForPhone = false
     }
     return r
   })
