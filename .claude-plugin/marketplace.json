@@ -1,0 +1,14 @@
+{
+  "name": "keepwarm",
+  "owner": {
+    "name": "luwux"
+  },
+  "description": "keepwarm: a Claude Code mod that guards the 1-hour prompt cache of idle sessions (macOS).",
+  "plugins": [
+    {
+      "name": "keepwarm",
+      "source": "./",
+      "description": "Idle-session guard for Claude Code's 1-hour prompt cache (macOS)."
+    }
+  ]
+}
