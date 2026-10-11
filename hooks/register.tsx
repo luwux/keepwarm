@@ -110,6 +110,7 @@ type State = {
   window: number
   compacted: boolean
   compactions: number // seen since this load: a command worked when it went up
+  turnError: boolean // the last main turn died on an API error (a usage limit, say)
   pending: Timer | null
   check: Timer | null
   expire: Timer | null
@@ -961,7 +962,10 @@ async function ping($: EngineInterface, s: State) {
   s.pingUsd += usd ?? 0
   await appendLog($, 'pings', { sid: s.sid, cwd: s.cwd, model: s.lastModel, ctx: s.ctx, owner: s.owner, ...s.last })
   if (warm && s.wakePrompt && reply.isAnswered) await wakeDecision($, s, reply.text, now)
-  if (!warm) return stop($, s, `ping 读 ${fmtTok(u.cache_read_input_tokens)}、写 ${fmtTok(u.cache_creation_input_tokens)}，缓存已经丢了`)
+  // Seen once (Taskline, 10-11): after a turn that died on a usage limit the fork no longer
+  // replays what the main thread sent, so it misses a cache that may still be warm.
+  const got = `ping 读 ${fmtTok(u.cache_read_input_tokens)}、写 ${fmtTok(u.cache_creation_input_tokens)}`
+  if (!warm) return stop($, s, s.turnError ? `${got}：上一轮因 API 错误（如额度用完）中断后，ping 对不上主对话的缓存` : `${got}，缓存已经丢了`)
   s.lastRequestAt = now
   await arm($, s)
 }
@@ -1252,7 +1256,7 @@ export const register: Register = (on, options) => {
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
     sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
-    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, compactions: 0, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
+    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, compactions: 0, turnError: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault,
     last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, phonePoll: null, phoneBusy: false,
   }
 
@@ -1578,6 +1582,7 @@ export const register: Register = (on, options) => {
     if (now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
     s.turnAt = s.lastRequestAt
     s.compacted = false
+    s.turnError = e.reason === 'error'
     if (e.usage?.model) s.lastModel = e.usage.model
     const usage = await $.session.usage()
     if (usage.context.tokens && usage.context.tokens > 0) s.ctx = usage.context.tokens
