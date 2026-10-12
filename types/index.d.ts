@@ -3,7 +3,6 @@ export type KeepwarmAdvice = {
   reason: string
   // What the session is about, in a few words (for notifications).
   topic?: string
-  instructions: string
   hours: number
   ctx: number
   coldUsd: number | null

@@ -332,12 +332,12 @@ async function auditedSubmit($: EngineInterface, s: State, purpose: string, text
   }
 }
 
-async function auditedCompact($: EngineInterface, s: State, instructions: string) {
+async function auditedCompact($: EngineInterface, s: State) {
   try {
-    await $.session.compact(instructions ? { instructions } : undefined)
-    await audit($, s, 'change', 'compact', { instructions })
+    await $.session.compact()
+    await audit($, s, 'change', 'compact', {})
   } catch (err) {
-    await audit($, s, 'change', 'compact', { instructions, ok: false, error: errText(err) })
+    await audit($, s, 'change', 'compact', { ok: false, error: errText(err) })
     throw err
   }
 }
@@ -405,7 +405,7 @@ async function panelPress($: EngineInterface, s: State, choice: PanelChoice) {
   const a = stored && !adviceStale(stored, now) ? stored : null
   await audit($, s, 'change', '面板按钮', { choice, advised: a?.action ?? null })
   if (choice === 'compact') {
-    await apply($, s, a ?? { action: 'compact', reason: '面板上手动 compact', topic: '', instructions: '', hours: 3, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: null, at: now, auto: false }, 'compact', 'user')
+    await apply($, s, a ?? { action: 'compact', reason: '面板上手动 compact', topic: '', hours: 3, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: null, at: now, auto: false }, 'compact', 'user')
   } else if (choice === 'advised' && a) {
     await apply($, s, a, 'keepwarm', 'user')
   } else if (choice === 'ignore' && a) {
@@ -535,7 +535,7 @@ async function phoneDo($: EngineInterface, s: State, choice: PhoneChoice) {
   if (choice.kind === 'compact') {
     const before = s.ctx
     const n = s.compactions
-    await apply($, s, a ?? { action: 'compact', reason: '手机通知上的 compact', topic: '', instructions: '', hours: 3, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: null, at: now, auto: false }, 'compact', 'user')
+    await apply($, s, a ?? { action: 'compact', reason: '手机通知上的 compact', topic: '', hours: 3, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: null, at: now, auto: false }, 'compact', 'user')
     const done = s.compactions > n
     await push($, s, `${name} · ${done ? '已 compact' : 'compact 没成功'}`,
       done ? `原来上下文 ${fmtTok(before)}，下一轮从摘要开始。` : '回到会话里手动 /compact。')
@@ -926,7 +926,7 @@ async function endWarn($: EngineInterface, s: State) {
   s.endWarnedFor = s.deadline
   const a: KeepwarmAdvice = {
     action: 'keepwarm', topic: '', reason: `保温约 ${fmtDuration(s.deadline - now)} 后结束，之后缓存会在 1 小时内过期。要续的话选保温`,
-    instructions: '', hours: DEFAULT_WINDOW_MS / 3_600_000, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: 0, at: now, auto: false,
+    hours: DEFAULT_WINDOW_MS / 3_600_000, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: 0, at: now, auto: false,
   }
   await offerAdvice($, s, a)
   await alert($, s, '保温快结束了', `${a.reason}（上下文 ${fmtTok(s.ctx)}，过期重写 ${fmtUsd(coldUsd(s))}）`, [warmButton(a.hours, '续'), IGNORE_BUTTON])
@@ -1066,7 +1066,7 @@ function judgePrompt(s: State, idleMs: number): string {
     '- keepwarm：任务还在进行或在等用户回复/审阅，细节仍然有用，用户很可能几小时内回来。',
     '- compact：一个阶段已经完成，之后只需要结论与要点，或上下文已接近上限。',
     '- ignore：对话已基本结束、用户短期内不会回来，或继续保留没有价值。',
-    '输出格式：{"action":"compact|keepwarm|ignore","topic":"<这个会话在做什么、做到哪一步了，中文，100 字以内>","reason":"<为什么这样建议，中文，100 字以内>","instructions":"<若 compact：给 /compact 的保留要点，写全；否则空>","hours":<若 keepwarm：建议保温小时数，1-12；否则 0>}',
+    '输出格式：{"action":"compact|keepwarm|ignore","topic":"<这个会话在做什么、做到哪一步了，中文，100 字以内>","reason":"<为什么这样建议，中文，100 字以内>","hours":<若 keepwarm：建议保温小时数，1-12；否则 0>}',
   ].join('\n')
 }
 
@@ -1089,8 +1089,7 @@ function leavePrompt(s: State, hours: number, machineOn: boolean, keepUsd: numbe
     `- compact：现在趁缓存还热压缩约 ${fmtUsd(compactUsd)}（含回来时冷读压缩结果），但会丢失细节。`,
     `- ignore：什么都不做，回来时重写缓存约 ${fmtUsd(coldUsd(s))}，细节全在。`,
     '综合花费和"回来后还需要哪些细节"判断。存放个人资料、长期记录、或正在进行且依赖大量细节的会话，不要建议 compact。',
-    '如果建议 compact，instructions 写清回来后继续工作必须保留的要点。',
-    `输出格式：{"action":"${machineOn ? 'compact|keepwarm|ignore' : 'compact|ignore'}","topic":"<这个会话在做什么、做到哪一步了，中文，100 字以内>","reason":"<为什么这样建议，中文，100 字以内>","instructions":"<若 compact：给 /compact 的保留要点，写全；否则空>","hours":${machineOn ? hours : 0}}`,
+    `输出格式：{"action":"${machineOn ? 'compact|keepwarm|ignore' : 'compact|ignore'}","topic":"<这个会话在做什么、做到哪一步了，中文，100 字以内>","reason":"<为什么这样建议，中文，100 字以内>","hours":${machineOn ? hours : 0}}`,
   ].join('\n')
 }
 
@@ -1112,7 +1111,7 @@ async function leaveCheck($: EngineInterface, s: State, hours: number, machineOn
     // No usable answer: pick the cheapest option by the numbers alone.
     const opts: [KeepwarmAdvice['action'], number | null][] = [['keepwarm', keepUsd], ['compact', compactUsd], ['ignore', coldUsd(s)]]
     const best = opts.filter(o => o[1] != null).sort((a, b) => (a[1] as number) - (b[1] as number))[0]
-    v = { action: best ? best[0] : 'ignore', topic: '', reason: '判断没有给出结果，按估算花费选了最便宜的', instructions: '', hours }
+    v = { action: best ? best[0] : 'ignore', topic: '', reason: '判断没有给出结果，按估算花费选了最便宜的', hours }
   }
   if (v.action === 'keepwarm' && !machineOn) v = { ...v, action: 'ignore' }
   const a: KeepwarmAdvice = {
@@ -1124,7 +1123,7 @@ async function leaveCheck($: EngineInterface, s: State, hours: number, machineOn
   return a
 }
 
-function parseVerdict(text: string): { action: KeepwarmAdvice['action']; topic: string; reason: string; instructions: string; hours: number } | null {
+function parseVerdict(text: string): { action: KeepwarmAdvice['action']; topic: string; reason: string; hours: number } | null {
   const m = /\{[\s\S]*\}/.exec(text)
   if (!m) return null
   try {
@@ -1132,7 +1131,7 @@ function parseVerdict(text: string): { action: KeepwarmAdvice['action']; topic: 
     const action = v.action === 'compact' || v.action === 'keepwarm' || v.action === 'ignore' ? v.action : null
     if (!action) return null
     const hours = typeof v.hours === 'number' && v.hours > 0 ? Math.min(v.hours, 12) : 3
-    return { action, topic: String(v.topic ?? '').slice(0, 400), reason: String(v.reason ?? '').slice(0, 400), instructions: String(v.instructions ?? '').slice(0, 3000), hours }
+    return { action, topic: String(v.topic ?? '').slice(0, 400), reason: String(v.reason ?? '').slice(0, 400), hours }
   } catch {
     return null
   }
@@ -1144,9 +1143,11 @@ async function apply($: EngineInterface, s: State, a: KeepwarmAdvice, choice: Ke
   await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: a.ctx, advised: a.action, reason: a.reason, chosen: choice, by })
   await update($, advice, () => null)
   if (choice === 'compact') {
-    const command = a.instructions ? `/compact ${a.instructions.replace(/\s+/g, ' ').trim()}` : '/compact'
+    // A plain /compact: the compaction reads the whole conversation itself, so a list of what to
+    // keep written by the judge only costs output tokens and narrows the summary.
+    const command = '/compact'
     try {
-      await auditedCompact($, s, a.instructions)
+      await auditedCompact($, s)
     } catch {
       // Headless hosts (the desktop app, the SDK) refuse a direct compaction and refuse a prompt
       // that starts with "/": run the /compact command itself. The clipboard stays as the last
@@ -1154,7 +1155,7 @@ async function apply($: EngineInterface, s: State, a: KeepwarmAdvice, choice: Ke
       let failed = ''
       const n = s.compactions
       try {
-        await auditedCommand($, s, 'compact（以 /compact 命令执行）', 'compact', a.instructions)
+        await auditedCommand($, s, 'compact（以 /compact 命令执行）', 'compact', '')
         if (s.compactions === n) failed = '命令已执行，但没有看到压缩发生'
       } catch (err) {
         failed = errText(err)
@@ -1221,7 +1222,7 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
   const judgeUsd = forkUsd(u, priceOf(s.lastModel))
   // The fork read the whole prefix, so the cache is good for another hour.
   if (forkWasWarm(u)) s.lastRequestAt = now
-  const v = parseVerdict(reply.text) ?? { action: 'keepwarm' as const, topic: '', reason: '判断结果无法解析，默认建议保温', instructions: '', hours: 3 }
+  const v = parseVerdict(reply.text) ?? { action: 'keepwarm' as const, topic: '', reason: '判断结果无法解析，默认建议保温', hours: 3 }
   const a: KeepwarmAdvice = { ...v, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd, at: now, auto: s.policy === 'auto' }
   await appendLog($, 'judgements', { sid: s.sid, cwd: s.cwd, model: s.lastModel, ...a, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens })
   const label = { compact: '建议 compact', keepwarm: `建议保温 ${a.hours}h`, ignore: '建议不管' }[a.action]
