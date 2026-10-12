@@ -31,7 +31,10 @@ and speaks up *before* the hour runs out.
   `remindMinContext`): a desktop notification that jumps back to the session, plus a band above
   the prompt. With `idleCheck: judge` a fork of the session first decides whether to compact,
   keep warm or leave it; the fork reads the cache (about $0.03–0.10 at 100–400K tokens) and
-  refreshes it.
+  refreshes it. With `/keepwarm autorun 2`, a reminder nobody answers within 2 minutes (no tap,
+  no prompt in that session) is carried out: compact or keep warm as advised. A session that
+  scheduled its own wakeup (ScheduleWakeup, `/loop`) before the cache lapses gets no idle check
+  and no pings: its own request refreshes the cache.
 - **Keep-warm windows**: `/keepwarm on 8h` pings the cache whenever 55 minutes have passed since
   the last request, for 8 hours, whatever the session is doing. Only `/keepwarm off` ends it.
   A window opened from a reminder's button or by the model covers an absence, so it ends when
@@ -64,6 +67,7 @@ audit layer that records the real `usage` returned by the API and its dollar cos
 | `check` | judge now: compact, keep warm or leave it |
 | `leave 2h on\|off` | tell all sessions you are away (Mac on / lid closed) |
 | `idle off\|notify\|judge` | what the 50-minute idle check does |
+| `autorun 2\|off` | carry out an unanswered reminder after 2 minutes / only wait for you |
 | `alert on\|off\|test` | alerts |
 | `policy ask\|auto\|warm\|off` | per-project idle policy |
 | `guard refuse\|warn\|off` | when you write to a session whose cache is already cold |
@@ -73,7 +77,7 @@ audit layer that records the real `usage` returned by the API and its dollar cos
 ## Settings
 
 In `/config`, or `pluginConfigs.keepwarm.options` in `~/.claude/settings.json`: `idleCheck`
-(notify | judge | off), `remindMinContext`, `pingLimit`, `pingLimitHours`, `dailyBudgetUsd`,
+(notify | judge | off), `autorunMinutes`, `remindMinContext`, `pingLimit`, `pingLimitHours`, `dailyBudgetUsd`,
 `awayMinutes`, `ntfyConfigFile`.
 
 `ntfyConfigFile` points to a JSON file:

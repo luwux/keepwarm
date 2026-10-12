@@ -24,6 +24,8 @@
 - **状态栏倒计时**：`缓存 42m`，显示这个会话的缓存还剩多久。每次模型请求（包括工具结果）都会刷新。
 - **空闲提醒**：最后一轮结束约 50 分钟后，只针对上下文超过 `remindMinContext` 的会话，发一条能跳回会话的桌面通知，并在输入框上方显示提示条。
   设成 `idleCheck: judge` 时，会先让会话的一个分叉判断该 compact、保温还是不管。分叉读的是缓存（100–400K tokens 约 $0.03–0.10），顺便也刷新了缓存。
+  打开 `/keepwarm autorun 2` 后，提醒发出 2 分钟内你没点按钮、也没在会话里发消息，就照建议 compact 或保温。
+  会话自己用 ScheduleWakeup（或 `/loop`）定了缓存过期前的唤醒时，不做空闲检查，保温窗口也不 ping：它自己的请求会续上缓存。
 - **保温窗口**：`/keepwarm on 8h` 在 8 小时内，每当距上次请求满 55 分钟就 ping 一次缓存，不管会话在做什么，只有 `/keepwarm off` 能关。
   从提醒按钮或由模型开的窗口是为了你不在的时候，你回到这个会话发消息就结束。每个会话在 `pingLimitHours` 内最多 ping `pingLimit` 次。
 - **手机按钮**（可选，用 [ntfy](https://ntfy.sh)）：你离开 Mac 时，提醒会推到手机上，带 compact、保温 N 小时、不管三个按钮。
@@ -48,6 +50,7 @@
 | `check` | 现在判断一次：compact、保温还是不管 |
 | `leave 2h on\|off` | 告诉所有会话你要离开（电脑开着 / 合盖） |
 | `idle off\|notify\|judge` | 空闲 50 分钟时什么都不做 / 免费提醒 / 判断一次 |
+| `autorun 2\|off` | 提醒 2 分钟没人回应就照建议做 / 只等你选 |
 | `alert on\|off\|test` | 报警开关 |
 | `policy ask\|auto\|warm\|off` | 本项目空闲时的策略 |
 | `guard refuse\|warn\|off` | 缓存已冷还发消息时怎么办 |
@@ -56,7 +59,7 @@
 
 ## 设置
 
-在 `/config` 里，或 `~/.claude/settings.json` 的 `pluginConfigs.keepwarm.options`：`idleCheck`（notify | judge | off）、`remindMinContext`、`pingLimit`、`pingLimitHours`、`dailyBudgetUsd`、`awayMinutes`、`ntfyConfigFile`。
+在 `/config` 里，或 `~/.claude/settings.json` 的 `pluginConfigs.keepwarm.options`：`idleCheck`（notify | judge | off）、`autorunMinutes`、`remindMinContext`、`pingLimit`、`pingLimitHours`、`dailyBudgetUsd`、`awayMinutes`、`ntfyConfigFile`。
 
 `ntfyConfigFile` 指向一个 JSON 文件：
 

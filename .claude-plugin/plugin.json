@@ -1,6 +1,6 @@
 {
   "name": "keepwarm",
-  "version": "0.6.5",
+  "version": "0.7.0",
   "description": "Idle-session guard for Claude Code's 1-hour prompt cache (macOS): about 50 idle minutes after the last turn of a large session it notifies you, optionally after a cache-read fork judges whether to compact, keep warm or leave it; every request and change it makes is audited. Derived from cache-tax (MIT, Karan Bansal).",
   "author": {
     "name": "luwux"
@@ -17,6 +17,12 @@
         "judge",
         "off"
       ]
+    },
+    "autorunMinutes": {
+      "type": "number",
+      "title": "Act on an unanswered reminder after (minutes)",
+      "description": "With idleCheck judge: when nobody taps a button or writes in the session within this many minutes of a reminder, keepwarm does what it advised (compact or keep warm; nothing for \"leave it\"). 0: never. /keepwarm autorun overrides this.",
+      "default": 0
     },
     "remindMinContext": {
       "type": "number",
