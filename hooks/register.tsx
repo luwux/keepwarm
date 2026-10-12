@@ -191,7 +191,7 @@ const forkWasWarm = (u: Usage) => u.cache_read_input_tokens > 0 && u.cache_creat
 // The footer line: when this session's cache lapses, counted from the last request of any
 // kind (a turn, a judging fork, a ping), since each cache hit restarts the hour.
 function statusText(s: State, now: number): string | undefined {
-  if (s.stopped) return `保温已停：${s.stopped}`
+  // Why a window stopped goes to a toast and /keepwarm status, not here: the line shows the cache.
   if (!s.lastRequestAt || s.compacted) return undefined
   if (isCold(s, now)) return `缓存已冷 ${fmtDuration(now - s.lastRequestAt - TTL_MS)}`
   const cache = `缓存 ${fmtDuration(s.lastRequestAt + TTL_MS - now)}`
