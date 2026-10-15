@@ -36,10 +36,8 @@ const cfg = {
   pingLimitHours: 12,
   // What keepwarm may spend a day on its own (idle judges, pings of windows the model opened);
   // past it the idle check falls back to the free notice until midnight. 0: no limit.
-  dailyBudgetUsd: 3,
+  dailyBudgetUsd: 10,
   idleDefault: 'notify' as Idle,
-  // Minutes a reminder waits for an answer before keepwarm does what it advised. 0: never.
-  autorunMin: 0,
 }
 // Ping when the hour has five minutes left, whatever the session is doing (working, waiting on
 // background work, waiting on the person): only the time since the last request counts.
@@ -55,6 +53,15 @@ const PING_MIN_GAP_MS = 40 * 60 * 1000
 // A wakeup the session scheduled itself (ScheduleWakeup, /loop) refreshes the cache with its own
 // request: no idle check and no ping while one is due this long before the cache lapses.
 const WAKE_MARGIN_MS = 3 * 60 * 1000
+// An idle session the judge wants kept warm stays warm until this long after its last turn, then
+// is compacted. Two weeks of history (research/10-keepwarm-backlog.md, 10-14): daytime returns
+// come within six hours or the next day, and up to six hours the pings cost about what the
+// compactions they spare save.
+const KEEP_UNTIL_MS = 6 * 60 * 60 * 1000
+// Asleep, as far as the Mac can tell: these hours, and nobody has touched it for this long.
+const NIGHT_FROM = 22
+const NIGHT_TO = 7
+const ASLEEP_IDLE_S = 30 * 60
 const GUARD_MIN_CTX = 50_000
 const PING_PROMPT = 'Reply with the single word: warm'
 const TOOL = 'mcp__keepwarm__keepwarm'
@@ -140,9 +147,8 @@ type State = {
   // Buttons on a phone push: polling the reply topic while one of them may still be tapped.
   phonePoll: Timer | null
   phoneBusy: boolean
-  // Do what a reminder advised when nobody answers it within this many minutes (0: never).
-  autorun: number
-  autoTimer: Timer | null
+  // The window was opened by the idle judge: when it runs out, compact.
+  thenCompact: boolean
   // When the session's own scheduled wakeup fires next (ScheduleWakeup); 0 when none is known.
   wakeAt: number
 }
@@ -190,15 +196,9 @@ const forkWasWarm = (u: Usage) => u.cache_read_input_tokens > 0 && u.cache_creat
 
 // The footer line: when this session's cache lapses, counted from the last request of any
 // kind (a turn, a judging fork, a ping), since each cache hit restarts the hour.
-function statusText(s: State, now: number): string | undefined {
-  // Why a window stopped goes to a toast and /keepwarm status, not here: the line shows the cache.
-  if (!s.lastRequestAt || s.compacted) return undefined
-  if (isCold(s, now)) return `缓存已冷 ${fmtDuration(now - s.lastRequestAt - TTL_MS)}`
-  const cache = `缓存 ${fmtDuration(s.lastRequestAt + TTL_MS - now)}`
-  if (!s.deadline) return cache
-  const who = s.owner === 'model' ? '模型开的' : '你开的'
-  const last = s.last ? ` · 上次 ping ${fmtDuration(now - s.last.at)} 前 ${fmtUsd(s.last.usd)}` : ''
-  return `${cache} · 保温（${who}）剩 ${fmtDuration(s.deadline - now)} · ${fmtDuration(s.lastRequestAt + s.every - now)} 后 ping${last}`
+// Nothing in the status line (10-14): the person need not watch the cache; /keepwarm shows it.
+function statusText(_s: State, _now: number): string | undefined {
+  return undefined
 }
 
 // Each label is two Chinese characters and a full-width space, so the lines stay aligned in the
@@ -217,7 +217,7 @@ async function card($: EngineInterface, s: State, now: number): Promise<string> 
     : s.stopped ? `关（上次停止：${s.stopped}）` : '关'
   const remind = s.policy === 'off' || s.idle === 'off' ? '关'
     : wakesItself(s, now) ? `会话定好了 ${fmtDuration(s.wakeAt - now)} 后自己醒来，不用提醒`
-    : s.check ? `空闲 50 分钟时${s.idle === 'judge' && !over ? `判断一次（compact、保温还是不管）${s.autorun ? `，${s.autorun} 分钟没回应就照办` : ''}` : '免费提醒一次'}`
+    : s.check ? `空闲 50 分钟时${s.idle === 'judge' && !over ? `判断一次，然后自己 compact、保温到空闲 ${fmtDuration(KEEP_UNTIL_MS)} 后 compact，或不管` : '免费提醒一次'}`
     : s.deadline ? '保温期间不提醒'
     : `不提醒（上下文不到 ${fmtTok(cfg.remindMinCtx)}，或缓存已冷）`
   const missUsd = s.misses.reduce((a, m) => a + (m.usd ?? 0), 0)
@@ -231,7 +231,7 @@ async function card($: EngineInterface, s: State, now: number): Promise<string> 
     `记账　本会话冷写入 ${s.misses.length} 次 ${fmtUsd(missUsd)} · 本次运行 ping ${s.pings} 次 ${fmtUsd(s.pingUsd)}` +
       `${s.last ? `（上次读 ${fmtTok(s.last.read)}、写 ${fmtTok(s.last.write)}）` : ''}`,
     `今天　keepwarm 共花 ${fmtUsd(spent.auto + spent.manual)}：自己主动的 ${fmtUsd(spent.auto)}` +
-      `${cfg.dailyBudgetUsd ? `（上限 $${cfg.dailyBudgetUsd}${over ? '，已超，改为免费提醒' : ''}）` : ''}，你要求的 ${fmtUsd(spent.manual)}`,
+      `${cfg.dailyBudgetUsd ? `（上限 $${cfg.dailyBudgetUsd}${over ? '，已超，今天不再自动判断' : ''}）` : ''}，你要求的 ${fmtUsd(spent.manual)}`,
     `报警　${alertOn ? '开' : '关'}`,
     `设置　空闲检查 ${s.idle} · 提醒门槛 ${fmtTok(cfg.remindMinCtx)} · ping 上限 ${cfg.pingLimit} 次/${cfg.pingLimitHours} 小时 · ` +
       `冷发送${{ refuse: '先拦一次', warn: '只记账', off: '不管' }[s.guard]} · 项目策略 ${s.policy} · 手机推送${cfg.ntfyConfigFile ? `开（离开 ${cfg.awayIdleS / 60} 分钟后）` : '关'}`,
@@ -249,9 +249,8 @@ const HELP = [
   'check：现在判断一次：compact、保温还是不管',
   'leave 2h on|off：告诉所有会话你要离开多久（on 电脑开着，off 合盖或关机）',
   'idle off|notify|judge：空闲 50 分钟时什么都不做 / 免费提醒 / 判断一次',
-  'autorun 2|off：空闲判断的提醒 2 分钟内没人回应，就照建议 compact 或保温',
   'alert on|off|test：报警开关；test 发一条测试报警',
-  'policy ask|auto|warm|off：本项目空闲时问你 / 自动照办 / 总是保温 / 不管',
+  'policy auto|warm|off：本项目空闲时按判断自动处理 / 总是保温 / 不管（ask 同 auto）',
   'guard refuse|warn|off：缓存已冷还发消息时先拦一次 / 只记账 / 不管',
   'log [all] [requests|changes]：审计记录；ledger：冷写入账本',
   'push：发一条带按钮的测试推送到手机（真实提醒在你离开 Mac 时才推，带 compact / 保温 / 不管 按钮）',
@@ -565,7 +564,7 @@ async function phoneDo($: EngineInterface, s: State, choice: PhoneChoice) {
 
 // ---------- alerts: only what should not have happened, opt-in (/keepwarm alert on) ----------
 
-type AlarmKind = 'lapsed' | 'unexplained' | 'budget' | 'pinglimit'
+type AlarmKind = 'lapsed' | 'unexplained' | 'budget' | 'pinglimit' | 'compactfail'
 const ALARM_GAP_MS = 60 * 60 * 1000
 
 const dayStart = (now: number) => {
@@ -620,7 +619,7 @@ async function alertLine($: EngineInterface, now: number): Promise<string> {
   const spent = await spendToday($, now)
   const over = await overBudget($)
   return `alerts      报警${on ? '开' : '关'}（/keepwarm alert on|off|test）\n` +
-    `today       keepwarm 今天共花 ${fmtUsd(spent.auto + spent.manual)}：自己主动的 ${fmtUsd(spent.auto)}${cfg.dailyBudgetUsd ? `（上限 $${cfg.dailyBudgetUsd}${over ? '，已超，空闲检查改为免费提醒' : ''}）` : ''}，` +
+    `today       keepwarm 今天共花 ${fmtUsd(spent.auto + spent.manual)}：自己主动的 ${fmtUsd(spent.auto)}${cfg.dailyBudgetUsd ? `（上限 $${cfg.dailyBudgetUsd}${over ? '，已超，今天不再自动判断' : ''}）` : ''}，` +
     `你要求的 ${fmtUsd(spent.manual)}（你开的保温、check、离开判断；不设上限，每会话 ${cfg.pingLimitHours} 小时最多 ping ${cfg.pingLimit} 次）`
 }
 
@@ -739,8 +738,9 @@ async function save($: EngineInterface, s: State) {
     await $.store.set(key(s, 'reason'), s.reason)
     await $.store.set(key(s, 'wake'), s.wakePrompt)
     await $.store.set(key(s, 'sticky'), s.sticky)
+    await $.store.set(key(s, 'thenCompact'), s.thenCompact)
   } else {
-    for (const k of ['deadline', 'owner', 'reason', 'wake', 'sticky']) await $.store.delete(key(s, k))
+    for (const k of ['deadline', 'owner', 'reason', 'wake', 'sticky', 'thenCompact']) await $.store.delete(key(s, k))
   }
   if (s.userOff) await $.store.set(key(s, 'userOff'), true)
   else await $.store.delete(key(s, 'userOff'))
@@ -753,6 +753,7 @@ async function stop($: EngineInterface, s: State, why: string | null) {
   s.reason = ''
   s.wakePrompt = ''
   s.sticky = false
+  s.thenCompact = false
   s.stopped = why
   disarm(s)
   stopCaffeinate($, s)
@@ -768,9 +769,12 @@ async function arm($: EngineInterface, s: State) {
   const now = await $.clock.now()
   if (s.deadline && now >= s.deadline) {
     await audit($, s, 'change', '保温到期结束', { owner: s.owner })
+    const compact = s.thenCompact && !s.compacted && !isCold(s, now)
     s.deadline = 0
     s.owner = null
+    s.thenCompact = false
     await save($, s)
+    if (compact) return autoCompact($, s, `空闲 ${fmtDuration(now - s.turnAt)} 没人回来，保温结束`)
   }
   const live = s.lastRequestAt > 0 && !s.compacted && !isCold(s, now)
   if (s.deadline) {
@@ -950,6 +954,10 @@ async function ping($: EngineInterface, s: State) {
   const now = await $.clock.now()
   if (now >= s.deadline) return arm($, s)
   if (now - s.lastRequestAt < s.every - 1000) return arm($, s) // a turn re-armed meanwhile
+  if (s.thenCompact && (await asleep($, now))) {
+    await stop($, s, null)
+    return autoCompact($, s, '夜里 Mac 没人用，不再保温')
+  }
   if (wakesItself(s, now)) {
     // Its own wakeup will refresh the cache; ping only if that wakeup does not come.
     s.pending = $.clock.after(s.wakeAt + WAKE_MARGIN_MS / 2 - now, () => { void ping($, s) })
@@ -1178,7 +1186,10 @@ async function apply($: EngineInterface, s: State, a: KeepwarmAdvice, choice: Ke
       } catch (err) {
         failed = errText(err)
       }
-      if (failed) {
+      if (failed && by === 'auto') {
+        // Nobody is at the session: leave the clipboard alone, say it only through an alert.
+        await alarm($, s, 'compactfail', '自动 compact 没成功', `${failed}。会话还是原样，回来后可以手动 /compact。`)
+      } else if (failed) {
         const copied = await $.ui.copy({ text: command }).catch(() => ({ isCopied: false }))
         await audit($, s, 'change', '复制 /compact 命令到剪贴板', { copied: copied.isCopied })
         $.ui.toast(`compact 没能自动执行（${failed}）。${copied.isCopied ? '命令已复制，' : ''}请在输入框发送：${command}`)
@@ -1217,23 +1228,15 @@ async function expireAdvice($: EngineInterface, s: State) {
 // The session's own scheduled wakeup fires while the cache is still warm, with time to spare.
 const wakesItself = (s: State, now: number) => s.wakeAt > now && s.wakeAt < s.lastRequestAt + TTL_MS - WAKE_MARGIN_MS
 
-// Nobody answered the reminder within s.autorun minutes: do what it advised.
-function armAutorun($: EngineInterface, s: State, a: KeepwarmAdvice) {
-  if (s.autoTimer) s.autoTimer.cancel()
-  s.autoTimer = s.autorun > 0 ? $.clock.after(s.autorun * 60_000, () => { void autorun($, s, a) }) : null
+async function asleep($: EngineInterface, now: number): Promise<boolean> {
+  const h = new Date(now).getHours()
+  return (h >= NIGHT_FROM || h < NIGHT_TO) && (await idleSeconds($)) >= ASLEEP_IDLE_S
 }
 
-async function autorun($: EngineInterface, s: State, a: KeepwarmAdvice) {
-  s.autoTimer = null
+// Compact with nobody asked and nobody told: the audit log records it.
+async function autoCompact($: EngineInterface, s: State, reason: string) {
   const now = await $.clock.now()
-  const cur = await read($, advice)
-  // Answered meanwhile (a button, the panel, a prompt), replaced, or lapsed: nothing to do.
-  if (!cur || cur.at !== a.at || adviceStale(cur, now) || isCold(s, now) || s.compacted) return
-  const n = s.compactions
-  await apply($, s, a, a.action, 'auto')
-  const title = a.action === 'compact' ? (s.compactions > n ? '已自动 compact' : '自动 compact 没成功') : `已自动保温 ${a.hours}h`
-  await alert($, s, title, `提醒发出 ${s.autorun} 分钟内没有回应，照建议做了。` +
-    (a.action === 'keepwarm' ? '你回来在这个会话里发消息，保温就结束。' : s.compactions > n ? `原来上下文 ${fmtTok(a.ctx)}，下一轮从摘要开始。` : '回到会话里手动 /compact。'))
+  await apply($, s, { action: 'compact', reason, topic: '', hours: 0, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd: null, at: now, auto: true }, 'compact', 'auto')
 }
 
 async function idleCheck($: EngineInterface, s: State, forced = false) {
@@ -1249,7 +1252,12 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     await startWindow($, s, DEFAULT_WINDOW_MS, 'user', '项目策略：总是保温')
     return
   }
-  if ((s.idle === 'notify' || (await overBudget($))) && !forced) {
+  if (!forced && s.idle === 'judge' && (await overBudget($))) {
+    // Over the day's budget: no judge, and nothing to bother the person with.
+    await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'ignore', reason: '今天的自动预算已用完', chosen: 'budget', by: 'auto' })
+    return arm($, s)
+  }
+  if (s.idle === 'notify' && !forced) {
     // No model call: just say the cache is about to lapse and what that costs.
     const left = fmtDuration(TTL_MS - (now - s.lastRequestAt))
     const msg = `缓存约 ${left} 后过期。上下文 ${fmtTok(s.ctx)}，过期后重写约 ${fmtUsd(coldUsd(s))}，保温约 ${fmtUsd(hourUsd(s))}/h`
@@ -1269,16 +1277,19 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
   const v = parseVerdict(reply.text) ?? { action: 'keepwarm' as const, topic: '', reason: '判断结果无法解析，默认建议保温', hours: 3 }
   const a: KeepwarmAdvice = { ...v, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd, at: now, auto: s.policy === 'auto' }
   await appendLog($, 'judgements', { sid: s.sid, cwd: s.cwd, model: s.lastModel, ...a, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens })
-  const label = { compact: '建议 compact', keepwarm: `建议保温 ${a.hours}h`, ignore: '建议不管' }[a.action]
-  if (s.policy === 'auto') {
-    await notify($, s, `已自动${label.replace('建议', '')}`, a.reason)
-    await apply($, s, a, a.action, 'auto')
-  } else if (a.action !== 'ignore') {
-    await offerAdvice($, s, a)
-    const warm = warmButton(a.hours)
-    await alert($, s, label, `${a.topic ? `${a.topic}：` : ''}${a.reason}（上下文 ${fmtTok(a.ctx)}，过期重写 ${fmtUsd(a.coldUsd)}）`,
-      a.action === 'compact' ? [COMPACT_BUTTON, warm, IGNORE_BUTTON] : [warm, COMPACT_BUTTON, IGNORE_BUTTON])
-    armAutorun($, s, a)
+  if (forced) {
+    // /keepwarm check: the person asked, so show the advice and let them choose.
+    if (a.action !== 'ignore') await offerAdvice($, s, a)
+  } else if (a.action === 'compact' || (a.action === 'keepwarm' && (await asleep($, now)))) {
+    // Nobody is asked or told (10-14): compact now, also when the advice was to keep warm but
+    // the person has gone to bed and will be back only tomorrow.
+    return apply($, s, a.action === 'compact' ? a : { ...a, reason: `${a.reason}（夜里 Mac 没人用，直接 compact）` }, 'compact', 'auto')
+  } else if (a.action === 'keepwarm') {
+    await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: 'keepwarm', reason: a.reason, chosen: 'keepwarm', by: 'auto' })
+    await startWindow($, s, s.turnAt + KEEP_UNTIL_MS - now, 'model', `空闲判断：保温到空闲 ${fmtDuration(KEEP_UNTIL_MS)}，之后 compact`)
+    s.thenCompact = true
+    await save($, s)
+    return
   } else {
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: 'ignore', reason: a.reason, chosen: 'ignore', by: 'auto' })
   }
@@ -1298,12 +1309,11 @@ export const register: Register = (on, options) => {
   cfg.pingLimit = num(options.pingLimit, cfg.pingLimit)
   cfg.pingLimitHours = num(options.pingLimitHours, cfg.pingLimitHours) || cfg.pingLimitHours
   cfg.dailyBudgetUsd = num(options.dailyBudgetUsd, cfg.dailyBudgetUsd)
-  cfg.autorunMin = num(options.autorunMinutes, cfg.autorunMin)
   const idle = options.idleCheck
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
     sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
-    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, compactions: 0, turnError: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault, autorun: 0, autoTimer: null, wakeAt: 0,
+    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, compactions: 0, turnError: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault, thenCompact: false, wakeAt: 0,
     last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, phonePoll: null, phoneBusy: false,
   }
 
@@ -1319,8 +1329,9 @@ export const register: Register = (on, options) => {
       s.reason = ((await $.store.get(key(s, 'reason'))) as string | undefined) ?? ''
       s.wakePrompt = ((await $.store.get(key(s, 'wake'))) as string | undefined) ?? ''
       s.sticky = (await $.store.get(key(s, 'sticky'))) === true
+      s.thenCompact = (await $.store.get(key(s, 'thenCompact'))) === true
     } else if (saved !== undefined) {
-      for (const k of ['deadline', 'owner', 'reason', 'wake', 'sticky']) await $.store.delete(key(s, k))
+      for (const k of ['deadline', 'owner', 'reason', 'wake', 'sticky', 'thenCompact']) await $.store.delete(key(s, k))
     }
     s.userOff = (await $.store.get(key(s, 'userOff'))) === true
     await expireAdvice($, s) // a reminder left over from before a reload or restart
@@ -1344,8 +1355,6 @@ export const register: Register = (on, options) => {
     s.poll = $.clock.every(POLL_MS, () => { void poll($, s) })
     const idle = await $.store.get('idle')
     s.idle = idle === 'off' || idle === 'notify' || idle === 'judge' ? idle : cfg.idleDefault
-    const autorun = await $.store.get('autorun')
-    s.autorun = typeof autorun === 'number' ? autorun : cfg.autorunMin
     const policy = await $.store.get(`policy:${s.cwd}`)
     s.policy = policy === 'auto' || policy === 'warm' || policy === 'off' ? policy : 'ask'
     const guard = await $.store.get('guard')
@@ -1535,15 +1544,6 @@ export const register: Register = (on, options) => {
       await arm($, s)
       return { text: { off: '空闲检查已关：50 分钟时什么都不做', notify: '空闲检查改为只提醒：50 分钟时免费通知一下缓存快过期，不调用模型', judge: '空闲检查改为判断：50 分钟时 fork 一次（约 $0.03）给出 compact/保温/不管 建议' }[v] }
     }
-    if (cmd === 'autorun') {
-      const v = words[1]
-      const min = v === 'off' ? 0 : Number(v)
-      if (!v || !Number.isFinite(min) || min < 0 || min > 9) return { text: `自动照办：${s.autorun ? `提醒发出 ${s.autorun} 分钟内没回应就照建议做` : '关'}。用法：/keepwarm autorun 2|off（所有会话；分钟数 0-9）` }
-      s.autorun = min
-      await $.store.set('autorun', min)
-      await audit($, s, 'change', '改设置', { key: 'autorun', value: min })
-      return { text: min ? `已开：空闲判断的提醒发出 ${min} 分钟内，你没点按钮、也没在这个会话发消息，就照建议 compact 或保温（建议"不管"时什么都不做）` : '自动照办已关：提醒只等你选' }
-    }
     if (cmd === 'alert') {
       const v = words[1]
       if (v === 'test') {
@@ -1577,7 +1577,7 @@ export const register: Register = (on, options) => {
       await $.store.set(`policy:${s.cwd}`, p)
       await audit($, s, 'change', '改设置', { key: `policy:${s.cwd}`, value: p })
       await arm($, s)
-      const what = { ask: '空闲 50 分钟时判断并提醒你选择', auto: '空闲 50 分钟时判断并自动执行', warm: '空闲 50 分钟时直接保温 3 小时，不做判断', off: '不做空闲检查' }[p]
+      const what = { ask: '空闲 50 分钟时判断并自动执行（同 auto）', auto: '空闲 50 分钟时判断并自动执行', warm: '空闲 50 分钟时直接保温 3 小时，不做判断', off: '不做空闲检查' }[p]
       return { text: `${project(s)} 的策略设为 ${p}：${what}` }
     }
     if (cmd === 'on' || parseDuration(cmd) != null) {

@@ -25,16 +25,23 @@ and speaks up *before* the hour runs out.
 
 ## What it does
 
-- **Status line countdown**: `缓存 42m` ("cache 42m") until this session's cache lapses, refreshed on every
-  model request, tool-result requests included.
-- **Idle reminder** (~50 minutes after the last turn, only for sessions above
-  `remindMinContext`): a desktop notification that jumps back to the session, plus a band above
-  the prompt. With `idleCheck: judge` a fork of the session first decides whether to compact,
-  keep warm or leave it; the fork reads the cache (about $0.03–0.10 at 100–400K tokens) and
-  refreshes it. With `/keepwarm autorun 2`, a reminder nobody answers within 2 minutes (no tap,
-  no prompt in that session) is carried out: compact or keep warm as advised. A session that
-  scheduled its own wakeup (ScheduleWakeup, `/loop`) before the cache lapses gets no idle check
-  and no pings: its own request refreshes the cache.
+- **Idle check, handled without asking** (~50 minutes after the last turn, only for sessions
+  above `remindMinContext`). With `idleCheck: judge` a fork of the session decides whether to
+  compact, keep warm or leave it; the fork reads the cache (about $0.03–0.10 at 100–400K tokens)
+  and refreshes it. Then, with no notification:
+  - compact: the session is compacted at once;
+  - keep warm: the cache is kept warm until 6 hours after the last turn, then the session is
+    compacted; writing in the session ends this. At night (22:00–07:00 with no keyboard or mouse
+    input on the Mac for 30 minutes) it is compacted at once instead;
+  - leave it: nothing.
+
+  Six hours comes from two weeks of the author's sessions: daytime returns came within six hours
+  or the next day, and up to six hours the pings cost about what the compactions they spare
+  save. A session that scheduled its own wakeup (ScheduleWakeup, `/loop`) before the cache lapses
+  gets no idle check and no pings. With `idleCheck: notify` you get a free desktop reminder
+  instead. Claude Code's own idle compaction does the same without judging; turn it off with
+  `"idleCompaction": false` if you use this.
+- **No status line**: nothing to watch; `/keepwarm` shows the state.
 - **Keep-warm windows**: `/keepwarm on 8h` pings the cache whenever 55 minutes have passed since
   the last request, for 8 hours, whatever the session is doing. Only `/keepwarm off` ends it.
   A window opened from a reminder's button or by the model covers an absence, so it ends when
@@ -47,7 +54,7 @@ and speaks up *before* the hour runs out.
   nothing. Tokens expire after 3 hours; a tap after the cache has lapsed is answered, not acted on.
 - **Alerts** (`/keepwarm alert on`, off by default): only for what should not happen: a window
   whose pings could not go out, the cache rewritten within the hour on the same model, the ping
-  limit reached, or keepwarm's own daily budget (`dailyBudgetUsd`, $3) exceeded.
+  limit reached, or keepwarm's own daily budget (`dailyBudgetUsd`, $10) exceeded.
 - **Leaving**: `/keepwarm leave 2h` asks every live, warm session for its own verdict and shows
   one summary.
 - **Never blocks** a prompt unless you turn `guard refuse` on.
@@ -67,9 +74,8 @@ audit layer that records the real `usage` returned by the API and its dollar cos
 | `check` | judge now: compact, keep warm or leave it |
 | `leave 2h on\|off` | tell all sessions you are away (Mac on / lid closed) |
 | `idle off\|notify\|judge` | what the 50-minute idle check does |
-| `autorun 2\|off` | carry out an unanswered reminder after 2 minutes / only wait for you |
 | `alert on\|off\|test` | alerts |
-| `policy ask\|auto\|warm\|off` | per-project idle policy |
+| `policy auto\|warm\|off` | per-project idle policy: handle as judged / always keep warm / nothing |
 | `guard refuse\|warn\|off` | when you write to a session whose cache is already cold |
 | `log`, `ledger` | audit log, cold-write ledger |
 | `push`, `panel` | test push with buttons, button pane on the Mac |
@@ -77,7 +83,7 @@ audit layer that records the real `usage` returned by the API and its dollar cos
 ## Settings
 
 In `/config`, or `pluginConfigs.keepwarm.options` in `~/.claude/settings.json`: `idleCheck`
-(notify | judge | off), `autorunMinutes`, `remindMinContext`, `pingLimit`, `pingLimitHours`, `dailyBudgetUsd`,
+(notify | judge | off), `remindMinContext`, `pingLimit`, `pingLimitHours`, `dailyBudgetUsd`,
 `awayMinutes`, `ntfyConfigFile`.
 
 `ntfyConfigFile` points to a JSON file:
