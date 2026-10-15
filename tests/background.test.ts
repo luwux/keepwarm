@@ -77,3 +77,47 @@ test('a session with no project (a chat) gets no idle check at all', { options: 
   await clock.advance(3 * 60 * MIN)
   expect(forks).toEqual([])
 })
+
+test('a cold write after the hour sends one Mac notification', { options: { idleCheck: 'off' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 20, 0) })
+  mock.store(on)
+  const notices: string[] = []
+  let usage = { cache_read_input_tokens: CTX, cache_creation_input_tokens: 0, input_tokens: 10, output_tokens: 100, model: 'claude-opus-5-5' }
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  on('session.id', async () => ({ value: 'sid-2' }))
+  on('session.cwd', async () => ({ value: '/tmp/p' }))
+  on('session.surfaces', async () => ({ value: [] }))
+  on('command.register', async () => ({ value: { command: 'keepwarm' } }))
+  on('tool.register', async () => ({ value: { tool: 'keepwarm' } }))
+  on('prompt.submit', async (_$, e) => ({ text: e.text }))
+  on('turn.complete', async () => ({ text: '' }))
+  on('session.usage', async () => ({ value: { context: { tokens: CTX, window: 1_000_000 } } }) as never)
+  on('session.model', async () => ({ value: 'claude-opus-5-5' }))
+  on('ui.status', async () => ({ value: undefined }) as never)
+  on('ui.toast', async () => ({ value: undefined }) as never)
+  on('ui.log', async () => ({ value: undefined }) as never)
+  on('process.run', async (_$, e) => {
+    const argv = (e as { argv: string[] }).argv
+    if (argv[0] === 'terminal-notifier') notices.push(argv.join(' '))
+    return { value: { code: 0, stdout: '', stderr: '' } } as never
+  })
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
+  })
+  async function step(text: string) {
+    await $.prompt.submit({ text, origin: { kind: 'composer' } } as never)
+    for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude-opus-5-5' } as never)) { /* drain */ }
+    await $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  }
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await step('第一条')
+  await step('一分钟后，热的')
+  expect(notices).toEqual([])
+
+  await clock.advance(2 * 60 * MIN)
+  usage = { ...usage, cache_read_input_tokens: 40_000, cache_creation_input_tokens: CTX - 40_000 }
+  await step('两小时后回来')
+  expect(notices.length).toBe(1)
+  expect(notices[0]).toContain('冷写入')
+  expect(notices[0]).toContain('缓存过期')
+})

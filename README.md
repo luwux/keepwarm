@@ -62,6 +62,10 @@ and speaks up *before* the hour runs out.
   while it has buttons out, does what was tapped and pushes a confirmation. The three buttons of
   one notification share one token group: the first tap voids them all, so a second tap does
   nothing. Tokens expire after 3 hours; a tap after the cache has lapsed is answered, not acted on.
+- **Cold-write notice**: whenever the whole context is written again (the cache had lapsed, the
+  model changed, or the prompt prefix changed), a Mac notification says how many tokens, what it
+  cost, why, and whether a background task's report set it off. Not for a new session's first
+  message or right after a compaction; nothing goes to the phone.
 - **Alerts** (`/keepwarm alert on`, off by default): only for what should not happen: a window
   whose pings could not go out, the cache rewritten within the hour on the same model, the ping
   limit reached, or keepwarm's own daily budget (`dailyBudgetUsd`, $10) exceeded.

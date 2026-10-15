@@ -118,9 +118,8 @@ type State = {
   stepModel: string | null
   // The first request after a compaction writes the summary; that is not a miss.
   skipMiss: boolean
-  // The first request after this process started: a real miss is logged without a toast, since
-  // opening a cold session already said so.
-  quietMiss: boolean
+  // What started the current turn: 'person', or the origin of a turn nobody typed.
+  turnBy: string
   misses: Miss[]
   deadline: number
   every: number
@@ -721,22 +720,24 @@ async function checkMiss($: EngineInterface, s: State, u: TurnUsage, prevAt: num
   const prevModel = s.stepModel ?? s.lastModel
   s.stepCtx = read + write + u.input_tokens
   s.stepModel = u.model
-  const quiet = s.quietMiss
-  s.quietMiss = false
-  // Nothing was cached yet (a new session's first message), or the summary of a compaction.
-  if (!prevAt || s.skipMiss) {
+  // The summary of a compaction is written afresh by design.
+  if (s.skipMiss) {
     s.skipMiss = false
     return
   }
+  // Nothing was cached yet (a new session's first message, prev is 0), or no rewrite.
   if (prev <= 20000 || read >= 0.5 * prev || write < 0.5 * prev) return
   const now = await $.clock.now()
   const gapMs = prevAt ? now - prevAt : 0
-  const cause: MissCause = prevModel && prevModel !== u.model ? 'model' : gapMs > TTL_MS ? 'expired' : 'other'
+  // No last request known: an old session reopened after its record was dropped.
+  const cause: MissCause = prevModel && prevModel !== u.model ? 'model' : !prevAt || gapMs > TTL_MS ? 'expired' : 'other'
   const p = priceOf(u.model)
   const miss: Miss = { at: now, tokens: write, usd: p ? write * p[1] / 1e6 : null, cause, gapMs }
   s.misses.push(miss)
   await appendLog($, 'misses', { sid: s.sid, cwd: s.cwd, model: u.model, ...miss })
-  if (!quiet) $.ui.toast(`冷写入 ${fmtTok(write)} tokens，约 ${fmtUsd(miss.usd)}（${MISS_ZH[cause]}）`)
+  // Every real rewrite gets a Mac notification, nothing on the phone (asked for 10-14).
+  const by = s.turnBy === 'person' ? '' : s.turnBy === 'task-notification' ? '，后台任务回报时' : `，${s.turnBy} 触发`
+  await notify($, s, '冷写入', `重写 ${fmtTok(write)} tokens，约 ${fmtUsd(miss.usd)}（${MISS_ZH[cause]}${prevAt ? `，距上次请求 ${fmtDuration(gapMs)}` : ''}${by}）`)
   if (cause === 'other') {
     await alarm($, s, 'unexplained', '缓存被意外整段重写', `同一模型、距上次请求只有 ${fmtDuration(gapMs)}，仍整段重写了 ${fmtTok(write)} tokens（约 ${fmtUsd(miss.usd)}）。可能是系统提示或工具列表变了，或者回退、编辑了历史消息。`)
   } else if (cause === 'expired' && s.deadline) {
@@ -1387,7 +1388,7 @@ export const register: Register = (on, options) => {
   const idle = options.idleCheck
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
-    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
+    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, turnBy: 'person', misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
     lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, compactions: 0, turnError: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault, thenCompact: false, wakeAt: 0, wakeBySleep: false, bg: [],
     last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, phonePoll: null, phoneBusy: false,
   }
@@ -1717,6 +1718,7 @@ export const register: Register = (on, options) => {
     // the person coming back: it neither answers a reminder nor ends their absence's window.
     // Seen 10-14: a subagent's notice ended a window the person was away for.
     const person = !NOT_THE_PERSON.has(e.origin.kind)
+    s.turnBy = person ? 'person' : e.origin.kind
     // The person is back: an unanswered reminder is moot.
     if (person && (await read($, advice))) {
       const a = await read($, advice)
