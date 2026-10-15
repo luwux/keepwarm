@@ -214,12 +214,10 @@ function forkUsd(u: Usage, p: [number, number, number] | null): number | null {
 // A warm fork reads the prefix and writes only its own tail; a big write means the prefix broke.
 const forkWasWarm = (u: Usage) => u.cache_read_input_tokens > 0 && u.cache_creation_input_tokens < 0.1 * u.cache_read_input_tokens
 
-// The footer line, shown only once the cache has lapsed (10-14): how long ago, and what the next
-// message rewrites. The hour runs from the last request of any kind (a turn, a judging fork, a
-// ping), since each cache hit restarts it.
-function statusText(s: State, now: number): string | undefined {
-  if (s.compacted || s.ctx < GUARD_MIN_CTX || !isCold(s, now)) return undefined
-  return `缓存已冷 ${fmtDuration(now - s.lastRequestAt - TTL_MS)}，下一条消息重写约 ${fmtUsd(coldUsd(s))}`
+// Nothing under the prompt, warm or cold (10-14): a rewrite is told by a notice when it
+// happens, and /keepwarm shows the rest.
+function statusText(_s: State, _now: number): string | undefined {
+  return undefined
 }
 
 // Each label is two Chinese characters and a full-width space, so the lines stay aligned in the

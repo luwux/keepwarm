@@ -78,7 +78,7 @@ test('a session with no project (a chat) gets no idle check at all', { options: 
   expect(forks).toEqual([])
 })
 
-test('a lapsed cache shows in the footer, and its rewrite in one notice in Claude only', { options: { idleCheck: 'off' } }, async ($, on) => {
+test('a rewrite after the hour is one notice in Claude, and nothing shows under the prompt', { options: { idleCheck: 'off' } }, async ($, on) => {
   const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 20, 0) })
   mock.store(on)
   const notices: string[] = []
@@ -118,11 +118,11 @@ test('a lapsed cache shows in the footer, and its rewrite in one notice in Claud
   expect(footer.at(-1)).toBeUndefined()
 
   await clock.advance(2 * 60 * MIN)
-  expect(footer.at(-1)).toContain('缓存已冷 1h') // the minute tick redraws it while nobody types
+  expect(footer.filter(x => x !== undefined)).toEqual([])
   usage = { ...usage, cache_read_input_tokens: 40_000, cache_creation_input_tokens: CTX - 40_000 }
   await step('两小时后回来')
   expect(toasts.filter(x => x.startsWith('冷写入'))).toHaveLength(1)
   expect(toasts.at(-1)).toContain('缓存过期')
   expect(notices).toEqual([]) // no Mac notification
-  expect(footer.at(-1)).toBeUndefined() // warm again
+  expect(footer.filter(x => x !== undefined)).toEqual([])
 })

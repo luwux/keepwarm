@@ -51,9 +51,7 @@ and speaks up *before* the hour runs out.
   desktop sidebar group named in `skipGroups` (default `Chat`). With `idleCheck: notify` you get a free desktop reminder
   instead. Claude Code's own idle compaction does the same without judging; turn it off with
   `"idleCompaction": false` if you use this.
-- **Status line only when cold**: nothing shows while the cache is warm. Once it has lapsed (in
-  a session above 50K tokens), the line under the prompt says how long ago and what the next
-  message will rewrite, e.g. `缓存已冷 1h05m，下一条消息重写约 $2.40`. `/keepwarm` shows the rest.
+- **Nothing under the prompt**: no status line, warm or cold; `/keepwarm` shows the state.
 - **Keep-warm windows**: `/keepwarm on 8h` pings the cache whenever 55 minutes have passed since
   the last request, for 8 hours, whatever the session is doing. Only `/keepwarm off` ends it.
   A window opened from a reminder's button or by the model covers an absence, so it ends when
