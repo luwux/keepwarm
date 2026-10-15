@@ -1003,8 +1003,14 @@ async function ping($: EngineInterface, s: State) {
   s.pending = null
   if (!s.deadline) return
   const now = await $.clock.now()
-  // A window that ends where a ping would be due (a judged compaction) ends there, no ping.
+  // A window that ends while the last request's cache still holds needs no ping, only its end.
+  // A judged compaction's window ends 55 minutes after the judge, and the judge's own fork
+  // takes seconds, so the end can fall a little after this ping is due (10-15: one wasted ping).
   if (now >= s.deadline - 1000) return arm($, s)
+  if (s.deadline <= s.lastRequestAt + PING_AFTER_MS + 60_000) {
+    s.pending = $.clock.after(s.deadline - now, () => { void arm($, s) })
+    return
+  }
   if (now - s.lastRequestAt < s.every - 1000) return arm($, s) // a turn re-armed meanwhile
   // Night ends a judged window (the person is asleep); background work wakes the session anyway.
   if (s.thenCompact && !s.bg.length && (await asleep($, now))) {
@@ -1361,7 +1367,7 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     const night = a.action === 'keepwarm'
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: a.action, reason: a.reason, chosen: 'compact-later', by: 'auto' })
     s.thenCompact = true
-    await startWindow($, s, s.lastRequestAt + PING_AFTER_MS - now, 'model', `空闲判断：${night ? '夜里 Mac 没人用，' : ''}compact，等这次判断续上的一小时快用完时再压`)
+    await startWindow($, s, s.lastRequestAt + PING_AFTER_MS - (await $.clock.now()), 'model', `空闲判断：${night ? '夜里 Mac 没人用，' : ''}compact，等这次判断续上的一小时快用完时再压`)
     return
   } else if (a.action === 'keepwarm') {
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: 'keepwarm', reason: a.reason, chosen: 'keepwarm', by: 'auto' })

@@ -4,10 +4,11 @@ const MIN = 60_000
 const CTX = 300_000
 
 // The engine beneath: a 300K session on Opus, an idle Mac, and a fork that counts its calls.
-function world(on: Parameters<Parameters<typeof test>[1]>[1], cwd = '/tmp/p') {
+function world(on: Parameters<Parameters<typeof test>[1]>[1], cwd = '/tmp/p', verdict = 'keepwarm', judgeMs = 0) {
   const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 20, 0) })
   mock.store(on)
   const forks: string[] = []
+  const compactions: number[] = []
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('session.id', async () => ({ value: 'sid-1' }))
   on('session.cwd', async () => ({ value: cwd }))
@@ -24,11 +25,17 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], cwd = '/tmp/p') {
   on('session.usage', async () => ({ value: { context: { tokens: CTX, window: 1_000_000 } } }) as never)
   on('session.model', async () => ({ value: 'claude-opus-5-5' }))
   on('process.run', async () => ({ value: { code: 0, stdout: '', stderr: '' } }) as never)
-  on('model.fork', async ($, e) => {
-    forks.push(e.prompt.startsWith('[keepwarm 自动检查') ? 'judge' : 'ping')
-    return { value: { isAnswered: true, text: '{"action":"keepwarm","topic":"t","reason":"r","hours":3}', usage: { cache_read_input_tokens: CTX, cache_creation_input_tokens: 0, input_tokens: 16, output_tokens: 4 } } } as never
+  on('session.compact', async () => {
+    compactions.push(await clock.now())
+    return { messages: [{ role: 'user', text: 'summary', toolUses: [] }] } as never
   })
-  return { clock, forks }
+  on('model.fork', async ($, e) => {
+    const judge = e.prompt.startsWith('[keepwarm 自动检查')
+    forks.push(judge ? 'judge' : 'ping')
+    if (judge && judgeMs) await clock.sleep(judgeMs)
+    return { value: { isAnswered: true, text: `{"action":"${verdict}","topic":"t","reason":"r","hours":3}`, usage: { cache_read_input_tokens: CTX, cache_creation_input_tokens: 0, input_tokens: 16, output_tokens: 4 } } } as never
+  })
+  return { clock, forks, compactions }
 }
 
 async function turn($: Parameters<Parameters<typeof test>[1]>[0], kind: string, text: string) {
@@ -125,4 +132,21 @@ test('a rewrite after the hour is one notice in Claude, and nothing shows under 
   expect(toasts.at(-1)).toContain('缓存过期')
   expect(notices).toEqual([]) // no Mac notification
   expect(footer.filter(x => x !== undefined)).toEqual([])
+})
+
+test('a judged compaction waits out the hour the judge refreshed, with no ping before it', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const { clock, forks, compactions } = world(on, '/tmp/p', 'compact', 8000) // the judge's fork takes 8 s, as it did (10-15)
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '先到这里')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+  const start = await clock.now()
+
+  await clock.advance(50 * MIN + 10_000)
+  expect(forks).toEqual(['judge'])
+  expect(compactions).toEqual([])
+
+  await clock.advance(56 * MIN)
+  expect(forks).toEqual(['judge']) // no ping at the end of the hour
+  expect(compactions).toHaveLength(1)
+  expect(compactions[0] - start).toBeLessThan(50 * MIN + 56 * MIN) // inside the hour the judge refreshed
 })
