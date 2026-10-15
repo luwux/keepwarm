@@ -28,7 +28,7 @@
   - 不管：什么都不做。
 
   6 小时来自作者两周的会话记录：白天要么 6 小时内回来，要么第二天才回来；6 小时以内，多 ping 的钱和少做 compact 省下的钱差不多抵消。
-  会话自己用 ScheduleWakeup（或 `/loop`）定了缓存过期前的唤醒时，不做空闲检查，也不 ping。设成 `idleCheck: notify` 则只发一条免费的桌面提醒。
+  会话自己用 ScheduleWakeup（或 `/loop`）定了缓存过期前的唤醒时，不做空闲检查，也不 ping；放在侧边栏分组 `skipGroups`（默认 `Chat`，用完即弃的聊天）里的会话也一样。设成 `idleCheck: notify` 则只发一条免费的桌面提醒。
   Claude Code 自带的 idle compaction 做的是同一件事但不做判断，用这个插件时可以设 `"idleCompaction": false` 关掉它。
 - **不占状态栏**：不用盯着看，`/keepwarm` 能查状态。
 - **保温窗口**：`/keepwarm on 8h` 在 8 小时内，每当距上次请求满 55 分钟就 ping 一次缓存，不管会话在做什么，只有 `/keepwarm off` 能关。
@@ -63,7 +63,7 @@
 
 ## 设置
 
-在 `/config` 里，或 `~/.claude/settings.json` 的 `pluginConfigs.keepwarm.options`：`idleCheck`（notify | judge | off）、`remindMinContext`、`pingLimit`、`pingLimitHours`、`dailyBudgetUsd`、`awayMinutes`、`ntfyConfigFile`。
+在 `/config` 里，或 `~/.claude/settings.json` 的 `pluginConfigs.keepwarm.options`：`idleCheck`（notify | judge | off）、`remindMinContext`、`skipGroups`、`pingLimit`、`pingLimitHours`、`dailyBudgetUsd`、`awayMinutes`、`ntfyConfigFile`。
 
 `ntfyConfigFile` 指向一个 JSON 文件：
 

@@ -1,6 +1,6 @@
 {
   "name": "keepwarm",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Idle-session guard for Claude Code's 1-hour prompt cache (macOS): about 50 idle minutes after the last turn of a large session it notifies you, optionally after a cache-read fork judges whether to compact, keep warm or leave it; every request and change it makes is audited. Derived from cache-tax (MIT, Karan Bansal).",
   "author": {
     "name": "luwux"
@@ -23,6 +23,12 @@
       "title": "Minimum context to remind (tokens)",
       "description": "Sessions smaller than this are never reminded: a cold rewrite of them is cheap.",
       "default": 250000
+    },
+    "skipGroups": {
+      "type": "string",
+      "title": "Sidebar groups without idle check",
+      "description": "Comma-separated names of desktop sidebar groups whose sessions are never judged, kept warm or compacted (chats used once and left). Case-insensitive.",
+      "default": "Chat"
     },
     "pingLimit": {
       "type": "number",

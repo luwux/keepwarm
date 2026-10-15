@@ -38,6 +38,8 @@ const cfg = {
   // past it the idle check falls back to the free notice until midnight. 0: no limit.
   dailyBudgetUsd: 10,
   idleDefault: 'notify' as Idle,
+  // Desktop sidebar groups (lower case) whose sessions get no idle check: chats used once and left.
+  skipGroups: ['chat'],
 }
 // Ping when the hour has five minutes left, whatever the session is doing (working, waiting on
 // background work, waiting on the person): only the time since the last request counts.
@@ -637,6 +639,26 @@ async function desktopSession($: EngineInterface, s: State): Promise<{ id: strin
   } catch {
     return null
   }
+}
+
+const DESKTOP_CONFIG = '$HOME/Library/Application Support/Claude/claude_desktop_config.json'
+
+// The desktop sidebar group this session is filed under, by name; '' when none (or not the app).
+async function sidebarGroup($: EngineInterface, s: State): Promise<string> {
+  const ds = await desktopSession($, s)
+  if (!ds) return ''
+  try {
+    const r = await $.process.run(['sh', '-c', `cat "${DESKTOP_CONFIG}"`])
+    type Scope = { groups?: Array<{ id: string; name: string }>; assignments?: Record<string, string> }
+    const scopes = ((JSON.parse(r.stdout) as { preferences?: { epitaxyPrefs?: Record<string, unknown> } })
+      .preferences?.epitaxyPrefs?.['dframe-group-scopes'] ?? {}) as Record<string, Scope>
+    for (const scope of Object.values(scopes)) {
+      const id = scope.assignments?.[`code:${ds.id}`]
+      const group = id ? scope.groups?.find(g => g.id === id) : undefined
+      if (group) return group.name
+    }
+  } catch { /* no desktop app config */ }
+  return ''
 }
 
 async function notify($: EngineInterface, s: State, title: string, message: string) {
@@ -1248,6 +1270,13 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'ignore', reason: `会话定好了 ${fmtDuration(s.wakeAt - now)} 后自己醒来`, chosen: 'self-wake', by: 'auto' })
     return arm($, s)
   }
+  if (!forced && cfg.skipGroups.length) {
+    const group = await sidebarGroup($, s)
+    if (group && cfg.skipGroups.includes(group.toLowerCase())) {
+      await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'ignore', reason: `侧边栏分组「${group}」不做空闲检查`, chosen: 'skip-group', by: 'auto' })
+      return arm($, s)
+    }
+  }
   if (s.policy === 'warm') {
     await startWindow($, s, DEFAULT_WINDOW_MS, 'user', '项目策略：总是保温')
     return
@@ -1309,6 +1338,7 @@ export const register: Register = (on, options) => {
   cfg.pingLimit = num(options.pingLimit, cfg.pingLimit)
   cfg.pingLimitHours = num(options.pingLimitHours, cfg.pingLimitHours) || cfg.pingLimitHours
   cfg.dailyBudgetUsd = num(options.dailyBudgetUsd, cfg.dailyBudgetUsd)
+  if (typeof options.skipGroups === 'string') cfg.skipGroups = options.skipGroups.split(',').map(g => g.trim().toLowerCase()).filter(Boolean)
   const idle = options.idleCheck
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {

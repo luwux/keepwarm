@@ -38,7 +38,8 @@ and speaks up *before* the hour runs out.
   Six hours comes from two weeks of the author's sessions: daytime returns came within six hours
   or the next day, and up to six hours the pings cost about what the compactions they spare
   save. A session that scheduled its own wakeup (ScheduleWakeup, `/loop`) before the cache lapses
-  gets no idle check and no pings. With `idleCheck: notify` you get a free desktop reminder
+  gets no idle check and no pings, nor does one filed under a desktop sidebar group named in
+  `skipGroups` (default `Chat`: chats used once and left). With `idleCheck: notify` you get a free desktop reminder
   instead. Claude Code's own idle compaction does the same without judging; turn it off with
   `"idleCompaction": false` if you use this.
 - **No status line**: nothing to watch; `/keepwarm` shows the state.
@@ -83,7 +84,7 @@ audit layer that records the real `usage` returned by the API and its dollar cos
 ## Settings
 
 In `/config`, or `pluginConfigs.keepwarm.options` in `~/.claude/settings.json`: `idleCheck`
-(notify | judge | off), `remindMinContext`, `pingLimit`, `pingLimitHours`, `dailyBudgetUsd`,
+(notify | judge | off), `remindMinContext`, `skipGroups`, `pingLimit`, `pingLimitHours`, `dailyBudgetUsd`,
 `awayMinutes`, `ntfyConfigFile`.
 
 `ntfyConfigFile` points to a JSON file:

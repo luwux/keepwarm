@@ -11,7 +11,7 @@ src = pathlib.Path(__file__).resolve().parent.parent / 'hooks' / 'register.tsx'
 lines = src.read_text().splitlines()
 RAW = re.compile(r'\$\.(model\.(fork|complete)|mcp\.call|command\.run|prompt\.submit|session\.(compact|append)|process\.(run|spawn)|ui\.copy)\(')
 AUDIT_LAYER = {'auditedFork', 'auditedComplete', 'auditedMcp', 'auditedRun', 'auditedSubmit', 'auditedCompact', 'auditedCommand'}
-READ_ONLY = {'idleSeconds', 'desktopSession', 'busGet', 'busAll', 'ntfyConfig', 'readReplies'}  # these only read
+READ_ONLY = {'idleSeconds', 'desktopSession', 'sidebarGroup', 'busGet', 'busAll', 'ntfyConfig', 'readReplies'}  # these only read
 FN = re.compile(r'^(?:export\s+)?(?:async\s+)?function\s+(\w+)')
 
 fn = None
