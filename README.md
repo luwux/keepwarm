@@ -26,22 +26,29 @@ and speaks up *before* the hour runs out.
 ## What it does
 
 - **Idle check, handled without asking** (~50 minutes after the last turn, only for sessions
-  above `remindMinContext`). With `idleCheck: judge` a fork of the session decides whether to
-  compact, keep warm or leave it; the fork reads the cache (about $0.03–0.10 at 100–400K tokens)
-  and refreshes it. Then, with no notification:
+  above `remindMinContext`, 100K by default). If background work the session started (a shell,
+  a subagent, a monitor) is still running, nothing is judged: that work wakes the session when it
+  reports, so the cache is kept warm until then, day or night, at most 12 hours after the last
+  turn (then the session is compacted); in fifteen days of the author's sessions 80% of such
+  waits reported within 6 hours and 92% within 12. Otherwise, with `idleCheck: judge` a fork of
+  the session decides whether to compact, keep warm or leave it; the fork reads the cache (about
+  $0.03–0.10 at 100–400K tokens) and refreshes it. Then, with no notification:
   - compact: the session is compacted about 55 minutes later, when the hour the judge's own
     read bought is nearly over; it costs the same, and coming back before then keeps the full
     context;
   - keep warm: the cache is kept warm until 6 hours after the last turn, then the session is
-    compacted; writing in the session ends this. At night (22:00–07:00 with no keyboard or mouse
+    compacted; any turn in the session ends this (yours, or background work reporting), and the
+    next quiet stretch is checked afresh. At night (22:00–07:00 with no keyboard or mouse
     input on the Mac for 30 minutes) it is compacted like a compact verdict instead;
   - leave it: nothing.
 
   Six hours comes from two weeks of the author's sessions: daytime returns came within six hours
   or the next day, and up to six hours the pings cost about what the compactions they spare
-  save. A session that scheduled its own wakeup (ScheduleWakeup, `/loop`) before the cache lapses
-  gets no idle check and no pings, nor does one filed under a desktop sidebar group named in
-  `skipGroups` (default `Chat`: chats used once and left). With `idleCheck: notify` you get a free desktop reminder
+  save. A session that scheduled its own wakeup before the cache lapses (ScheduleWakeup, `/loop`,
+  or a background shell that starts with `sleep N`) gets no idle check and no pings; so the model
+  need not wake itself to keep the cache warm. Nor does a session with no project, which runs in a
+  folder the app made for it (the + beside *This computer*; `skipScratch`), or one filed under a
+  desktop sidebar group named in `skipGroups` (default `Chat`). With `idleCheck: notify` you get a free desktop reminder
   instead. Claude Code's own idle compaction does the same without judging; turn it off with
   `"idleCompaction": false` if you use this.
 - **No status line**: nothing to watch; `/keepwarm` shows the state.
@@ -86,7 +93,7 @@ audit layer that records the real `usage` returned by the API and its dollar cos
 ## Settings
 
 In `/config`, or `pluginConfigs.keepwarm.options` in `~/.claude/settings.json`: `idleCheck`
-(notify | judge | off), `remindMinContext`, `skipGroups`, `pingLimit`, `pingLimitHours`, `dailyBudgetUsd`,
+(notify | judge | off), `remindMinContext`, `skipScratch`, `skipGroups`, `pingLimit`, `pingLimitHours`, `dailyBudgetUsd`,
 `awayMinutes`, `ntfyConfigFile`.
 
 `ntfyConfigFile` points to a JSON file:

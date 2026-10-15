@@ -28,7 +28,9 @@ type Idle = 'off' | 'notify' | 'judge'
 const cfg = {
   // A JSON file {"server": "https://ntfy.sh", "topic": "..."}; empty means no phone push.
   ntfyConfigFile: '',
-  remindMinCtx: 250_000, // below this a cold rewrite is not worth an interruption
+  // Below this a cold rewrite costs too little to judge (100K on Opus: about $0.5). It was 250K
+  // while the check interrupted the person; since 0.8.0 nothing does (10-14).
+  remindMinCtx: 100_000,
   awayIdleS: 5 * 60,
   // A safety net against a runaway timer: per session, at most pingLimit pings in any
   // pingLimitHours (one every 55 minutes is 13 in 12 hours).
@@ -40,6 +42,9 @@ const cfg = {
   idleDefault: 'notify' as Idle,
   // Desktop sidebar groups (lower case) whose sessions get no idle check: chats used once and left.
   skipGroups: ['chat'],
+  // Nor do sessions with no project, which run in a folder the app made for them (the + beside
+  // "This computer" in the sidebar): the person's real chats (10-14).
+  skipScratch: true,
 }
 // Ping when the hour has five minutes left, whatever the session is doing (working, waiting on
 // background work, waiting on the person): only the time since the last request counts.
@@ -60,6 +65,14 @@ const WAKE_MARGIN_MS = 3 * 60 * 1000
 // come within six hours or the next day, and up to six hours the pings cost about what the
 // compactions they spare save.
 const KEEP_UNTIL_MS = 6 * 60 * 60 * 1000
+// A session waiting on background work it started (a shell, a subagent, a monitor) is woken by
+// that work when it reports, whoever is around: it stays warm until then, with no judge, day or
+// night, at most this long after its last turn, and is then compacted. Fifteen days of history
+// (research/10-keepwarm-backlog.md, 10-14): 80% of such waits report within 6 hours, 92% in 12.
+const BG_KEEP_MS = 12 * 60 * 60 * 1000
+// A background shell that starts by sleeping is the session's own alarm clock: sessions use
+// `sleep 3300` because ScheduleWakeup fires only under /loop.
+const SELF_WAKE = /^\s*sleep\s+(\d+(?:\.\d+)?)\s*(?:$|[;&|\n])/
 // Asleep, as far as the Mac can tell: these hours, and nobody has touched it for this long.
 const NIGHT_FROM = 22
 const NIGHT_TO = 7
@@ -152,8 +165,13 @@ type State = {
   phoneBusy: boolean
   // The window was opened by the idle judge: when it runs out, compact.
   thenCompact: boolean
-  // When the session's own scheduled wakeup fires next (ScheduleWakeup); 0 when none is known.
+  // When the session's own scheduled wakeup fires next (ScheduleWakeup, a sleeping background
+  // shell); 0 when none is known.
   wakeAt: number
+  wakeBySleep: boolean
+  // The background work still running when the main thread last stopped, as the engine lists it:
+  // it wakes the session when it reports.
+  bg: string[]
 }
 
 const advice = atom({ plugin: 'keepwarm', key: 'advice' } as const, null as KeepwarmAdvice | null)
@@ -220,6 +238,7 @@ async function card($: EngineInterface, s: State, now: number): Promise<string> 
     : s.stopped ? `关（上次停止：${s.stopped}）` : '关'
   const remind = s.policy === 'off' || s.idle === 'off' ? '关'
     : wakesItself(s, now) ? `会话定好了 ${fmtDuration(s.wakeAt - now)} 后自己醒来，不用提醒`
+    : s.check && s.bg.length ? `${s.bg.length} 个后台任务在跑：空闲 50 分钟时开始保温到它们回报（最长到空闲 ${fmtDuration(BG_KEEP_MS)}）`
     : s.check ? `空闲 50 分钟时${s.idle === 'judge' && !over ? `判断一次，然后自己 compact、保温到空闲 ${fmtDuration(KEEP_UNTIL_MS)} 后 compact，或不管` : '免费提醒一次'}`
     : s.deadline ? '保温期间不提醒'
     : `不提醒（上下文不到 ${fmtTok(cfg.remindMinCtx)}，或缓存已冷）`
@@ -642,6 +661,8 @@ async function desktopSession($: EngineInterface, s: State): Promise<{ id: strin
   }
 }
 
+// The folder the desktop app makes for a session started with no project.
+const SCRATCH = /\/Library\/Application Support\/Claude\/scratch-workspaces\//
 const DESKTOP_CONFIG = '$HOME/Library/Application Support/Claude/claude_desktop_config.json'
 
 // The desktop sidebar group this session is filed under, by name; '' when none (or not the app).
@@ -980,7 +1001,8 @@ async function ping($: EngineInterface, s: State) {
   // A window that ends where a ping would be due (a judged compaction) ends there, no ping.
   if (now >= s.deadline - 1000) return arm($, s)
   if (now - s.lastRequestAt < s.every - 1000) return arm($, s) // a turn re-armed meanwhile
-  if (s.thenCompact && (await asleep($, now))) {
+  // Night ends a judged window (the person is asleep); background work wakes the session anyway.
+  if (s.thenCompact && !s.bg.length && (await asleep($, now))) {
     await stop($, s, null)
     return autoCompact($, s, '夜里 Mac 没人用，不再保温')
   }
@@ -1281,6 +1303,10 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
       return arm($, s)
     }
   }
+  if (!forced && cfg.skipScratch && SCRATCH.test(await $.session.cwd())) {
+    await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'ignore', reason: '没有项目的聊天会话（app 自建的临时文件夹）不做空闲检查', chosen: 'skip-scratch', by: 'auto' })
+    return arm($, s)
+  }
   if (s.policy === 'warm') {
     await startWindow($, s, DEFAULT_WINDOW_MS, 'user', '项目策略：总是保温')
     return
@@ -1289,6 +1315,15 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     // Over the day's budget: no judge, and nothing to bother the person with.
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'ignore', reason: '今天的自动预算已用完', chosen: 'budget', by: 'auto' })
     return arm($, s)
+  }
+  if (!forced && s.bg.length && !(await overBudget($))) {
+    // Waiting on background work it started, which wakes it when it reports: keep warm until then
+    // with no judge, day or night (the session itself comes back, not only the person).
+    const what = s.bg.slice(0, 3).join('；')
+    await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'keepwarm', reason: `后台任务在跑：${what}`, chosen: 'background', by: 'auto' })
+    s.thenCompact = true
+    await startWindow($, s, s.turnAt + BG_KEEP_MS - now, 'model', `等 ${s.bg.length} 个后台任务回报（${what}），最长到空闲 ${fmtDuration(BG_KEEP_MS)}，之后 compact`)
+    return
   }
   if (s.idle === 'notify' && !forced) {
     // No model call: just say the cache is about to lapse and what that costs.
@@ -1347,12 +1382,13 @@ export const register: Register = (on, options) => {
   cfg.pingLimit = num(options.pingLimit, cfg.pingLimit)
   cfg.pingLimitHours = num(options.pingLimitHours, cfg.pingLimitHours) || cfg.pingLimitHours
   cfg.dailyBudgetUsd = num(options.dailyBudgetUsd, cfg.dailyBudgetUsd)
+  if (typeof options.skipScratch === 'boolean') cfg.skipScratch = options.skipScratch
   if (typeof options.skipGroups === 'string') cfg.skipGroups = options.skipGroups.split(',').map(g => g.trim().toLowerCase()).filter(Boolean)
   const idle = options.idleCheck
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
     sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, quietMiss: true, misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
-    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, compactions: 0, turnError: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault, thenCompact: false, wakeAt: 0,
+    lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, compactions: 0, turnError: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault, thenCompact: false, wakeAt: 0, wakeBySleep: false, bg: [],
     last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, phonePoll: null, phoneBusy: false,
   }
 
@@ -1373,6 +1409,8 @@ export const register: Register = (on, options) => {
       for (const k of ['deadline', 'owner', 'reason', 'wake', 'sticky', 'thenCompact']) await $.store.delete(key(s, k))
     }
     s.userOff = (await $.store.get(key(s, 'userOff'))) === true
+    const bg = await $.store.get(key(s, 'bg'))
+    s.bg = Array.isArray(bg) ? bg.filter((x): x is string => typeof x === 'string') : []
     await expireAdvice($, s) // a reminder left over from before a reload or restart
     if ((await phoneTokens($, s)).some(t => t.exp > now)) armPhonePoll($, s) // buttons on a push still out
     await loadRuntime($, s, now)
@@ -1419,7 +1457,10 @@ export const register: Register = (on, options) => {
         'they will be back. Pick hours to cover that gap (default 3, max 12). Call "stop" when the work is finished, the user ' +
         'is done for the day, or you are about to suggest /clear or a new session. A running window re-arms itself after every ' +
         'turn, so do not call start again each turn; call "status" if unsure. The user\'s /keepwarm command overrides you: if ' +
-        'they turned it off, start is refused. Without a window, an idle check at 50 minutes asks the user whether to compact. ' +
+        'they turned it off, start is refused. Without a window keepwarm already acts on its own: while background work you ' +
+        'started (a shell, a subagent, a monitor) runs, it keeps the cache warm until that work reports; otherwise an idle ' +
+        'check at 50 minutes keeps it warm or compacts. So never wake yourself (sleep, ScheduleWakeup) just to keep the cache ' +
+        'warm; start a window only for a wait no background task covers, such as a job on a remote server with no local watcher. ' +
         'If something should be checked while the user is away (a training job, a deploy, a service), pass wake_prompt: at each ' +
         'wake the fork first decides, knowing the time, to skip silently, record a one-line note in this conversation, run a ' +
         'real turn with tools (only then does the conversation grow), or stop.',
@@ -1479,7 +1520,40 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     const delay = typeof input.delaySeconds === 'number' ? Math.min(Math.max(input.delaySeconds, 60), 3600) : 0
     s.wakeAt = input.stop === true || !delay ? 0 : now + delay * 1000
+    s.wakeBySleep = false
     await audit($, s, 'change', '记下会话自己定的唤醒', { wakeAt: s.wakeAt ? new Date(s.wakeAt).toISOString() : null })
+    return r
+  })
+
+  // The same with a background shell that sleeps first (`sleep 3300`, seen in long research
+  // sessions, 10-11): it ends, and so wakes the session, when the sleep is over.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId || 'deny' in r || r.isError) return r
+    const input = e as unknown as { command?: unknown; run_in_background?: unknown }
+    const m = input.run_in_background === true && typeof input.command === 'string' ? SELF_WAKE.exec(input.command) : null
+    if (m) {
+      s.wakeAt = (await $.clock.now()) + Number(m[1]) * 1000
+      s.wakeBySleep = true
+      await audit($, s, 'change', '记下会话自己定的唤醒（后台 sleep）', { wakeAt: new Date(s.wakeAt).toISOString() })
+    }
+    return r
+  })
+
+  // When the main thread stops, the engine lists the background work still running (shells,
+  // subagents, monitors): each wakes the session when it reports.
+  on('classic.Stop', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agent_id) return r
+    const tasks = e.background_tasks ?? []
+    s.bg = tasks.map(t => (t.description || t.command || t.type).slice(0, 80))
+    // A sleeping shell no longer listed was stopped: its wakeup will not come.
+    if (s.wakeBySleep && e.background_tasks && !tasks.some(t => SELF_WAKE.test(t.command ?? ''))) {
+      s.wakeAt = 0
+      s.wakeBySleep = false
+    }
+    if (s.bg.length) await $.store.set(key(s, 'bg'), s.bg)
+    else await $.store.delete(key(s, 'bg'))
     return r
   })
 
@@ -1654,6 +1728,14 @@ export const register: Register = (on, options) => {
     // requests keep the cache warm and no ping goes out); only /keepwarm off ends it.
     if (person && s.deadline && !s.sticky && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) {
       await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: s.ctx, advised: 'keepwarm', reason: s.reason, chosen: 'returned-stop', by: 'user' })
+      await stop($, s, null)
+      s.stopped = null
+    }
+    // A window the idle check opened covers one quiet stretch: any turn ends it (a background task
+    // reporting, a wakeup), and that turn's end looks at the session afresh. No compaction: the
+    // turn has just used the context.
+    if (!person && s.deadline && s.thenCompact && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) {
+      await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: s.ctx, advised: 'keepwarm', reason: s.reason, chosen: 'woken-stop', by: 'auto' })
       await stop($, s, null)
       s.stopped = null
     }

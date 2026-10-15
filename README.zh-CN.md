@@ -21,14 +21,15 @@
 
 ## 功能
 
-- **空闲检查，自动处理、不打扰你**：最后一轮结束约 50 分钟后，只针对上下文超过 `remindMinContext` 的会话。
-  设成 `idleCheck: judge` 时，会让会话的一个分叉判断该 compact、保温还是不管。分叉读的是缓存（100–400K tokens 约 $0.03–0.10），顺便也刷新了缓存。然后不发任何通知：
+- **空闲检查，自动处理、不打扰你**：最后一轮结束约 50 分钟后，只针对上下文超过 `remindMinContext`（默认 100K）的会话。
+  会话自己起的后台任务（后台命令、子代理、Monitor）还在跑时不做判断：任务回报时会唤醒会话，所以一直保温到那时，白天夜里都一样，最长到最后一轮结束后 12 小时，到时 compact。作者 15 天的会话里，这种等待 80% 在 6 小时内回报，92% 在 12 小时内。
+  没有后台任务时，设成 `idleCheck: judge` 会让会话的一个分叉判断该 compact、保温还是不管。分叉读的是缓存（100–400K tokens 约 $0.03–0.10），顺便也刷新了缓存。然后不发任何通知：
   - compact：约 55 分钟后再 compact，也就是判断本身续上的那一小时快用完时。花的钱一样，期间回来还能接着用完整的上下文；
-  - 保温：保温到最后一轮结束后 6 小时，然后 compact；你在会话里发消息就结束。夜里（22 点到 7 点，且 Mac 已 30 分钟没有键盘鼠标操作）按 compact 处理；
+  - 保温：保温到最后一轮结束后 6 小时，然后 compact；会话里有任何一轮（你发消息，或后台任务回报）就结束，之后的空闲重新检查。夜里（22 点到 7 点，且 Mac 已 30 分钟没有键盘鼠标操作）按 compact 处理；
   - 不管：什么都不做。
 
   6 小时来自作者两周的会话记录：白天要么 6 小时内回来，要么第二天才回来；6 小时以内，多 ping 的钱和少做 compact 省下的钱差不多抵消。
-  会话自己用 ScheduleWakeup（或 `/loop`）定了缓存过期前的唤醒时，不做空闲检查，也不 ping；放在侧边栏分组 `skipGroups`（默认 `Chat`，用完即弃的聊天）里的会话也一样。设成 `idleCheck: notify` 则只发一条免费的桌面提醒。
+  会话自己定了缓存过期前的唤醒（ScheduleWakeup、`/loop`，或以 `sleep N` 开头的后台命令）时，不做空闲检查，也不 ping；所以模型不需要为了续缓存自己定时醒来。没有项目、跑在 app 自建临时文件夹里的会话（侧边栏 *This computer* 旁的 + 新建的聊天，`skipScratch`），以及放在侧边栏分组 `skipGroups`（默认 `Chat`）里的会话也一样。设成 `idleCheck: notify` 则只发一条免费的桌面提醒。
   Claude Code 自带的 idle compaction 做的是同一件事但不做判断，用这个插件时可以设 `"idleCompaction": false` 关掉它。
 - **不占状态栏**：不用盯着看，`/keepwarm` 能查状态。
 - **保温窗口**：`/keepwarm on 8h` 在 8 小时内，每当距上次请求满 55 分钟就 ping 一次缓存，不管会话在做什么，只有 `/keepwarm off` 能关。
@@ -63,7 +64,7 @@
 
 ## 设置
 
-在 `/config` 里，或 `~/.claude/settings.json` 的 `pluginConfigs.keepwarm.options`：`idleCheck`（notify | judge | off）、`remindMinContext`、`skipGroups`、`pingLimit`、`pingLimitHours`、`dailyBudgetUsd`、`awayMinutes`、`ntfyConfigFile`。
+在 `/config` 里，或 `~/.claude/settings.json` 的 `pluginConfigs.keepwarm.options`：`idleCheck`（notify | judge | off）、`remindMinContext`、`skipScratch`、`skipGroups`、`pingLimit`、`pingLimitHours`、`dailyBudgetUsd`、`awayMinutes`、`ntfyConfigFile`。
 
 `ntfyConfigFile` 指向一个 JSON 文件：
 
