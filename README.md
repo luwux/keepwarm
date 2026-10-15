@@ -28,9 +28,9 @@ and speaks up *before* the hour runs out.
 - **Idle check, handled without asking** (~50 minutes after the last turn, only for sessions
   above `remindMinContext`, 100K by default). If background work the session started (a shell,
   a subagent, a monitor) is still running, nothing is judged: that work wakes the session when it
-  reports, so the cache is kept warm until then, at most 12 hours after the last
-  turn (then the session is compacted); in fifteen days of the author's sessions 80% of such
-  waits reported within 6 hours and 92% within 12. Otherwise, with `idleCheck: judge` a fork of
+  reports, so the cache is kept warm until then, at most 12 hours after the last turn (then the
+  session is compacted); in fifteen days of the author's sessions 80% of such waits reported
+  within 6 hours and 92% within 12. Otherwise, with `idleCheck: judge` a fork of
   the session decides whether to compact, keep warm or leave it; the fork reads the cache (about
   $0.03–0.10 at 100–400K tokens) and refreshes it. Then, with no notification:
   - compact: the session is compacted about 55 minutes later, when the hour the judge's own
