@@ -28,7 +28,7 @@ and speaks up *before* the hour runs out.
 - **Idle check, handled without asking** (~50 minutes after the last turn, only for sessions
   above `remindMinContext`, 100K by default). If background work the session started (a shell,
   a subagent, a monitor) is still running, nothing is judged: that work wakes the session when it
-  reports, so the cache is kept warm until then, day or night, at most 12 hours after the last
+  reports, so the cache is kept warm until then, at most 12 hours after the last
   turn (then the session is compacted); in fifteen days of the author's sessions 80% of such
   waits reported within 6 hours and 92% within 12. Otherwise, with `idleCheck: judge` a fork of
   the session decides whether to compact, keep warm or leave it; the fork reads the cache (about
@@ -38,8 +38,9 @@ and speaks up *before* the hour runs out.
     context;
   - keep warm: the cache is kept warm until 6 hours after the last turn, then the session is
     compacted; any turn in the session ends this (yours, or background work reporting), and the
-    next quiet stretch is checked afresh. At night (22:00–07:00 with no keyboard or mouse
-    input on the Mac for 30 minutes) it is compacted like a compact verdict instead;
+    next quiet stretch is checked afresh. Night is no exception: an idle Mac is no sign you
+    have gone to bed, and coming back within hours, the pings cost less than compacting and
+    rewriting the cache;
   - leave it: nothing.
 
   Six hours comes from two weeks of the author's sessions: daytime returns came within six hours

@@ -66,17 +66,13 @@ const WAKE_MARGIN_MS = 3 * 60 * 1000
 // compactions they spare save.
 const KEEP_UNTIL_MS = 6 * 60 * 60 * 1000
 // A session waiting on background work it started (a shell, a subagent, a monitor) is woken by
-// that work when it reports, whoever is around: it stays warm until then, with no judge, day or
-// night, at most this long after its last turn, and is then compacted. Fifteen days of history
+// that work when it reports, whoever is around: it stays warm until then, with no judge, at most
+// this long after its last turn, and is then compacted. Fifteen days of history
 // (research/10-keepwarm-backlog.md, 10-14): 80% of such waits report within 6 hours, 92% in 12.
 const BG_KEEP_MS = 12 * 60 * 60 * 1000
 // A background shell that starts by sleeping is the session's own alarm clock: sessions use
 // `sleep 3300` because ScheduleWakeup fires only under /loop.
 const SELF_WAKE = /^\s*sleep\s+(\d+(?:\.\d+)?)\s*(?:$|[;&|\n])/
-// Asleep, as far as the Mac can tell: these hours, and nobody has touched it for this long.
-const NIGHT_FROM = 22
-const NIGHT_TO = 7
-const ASLEEP_IDLE_S = 30 * 60
 const GUARD_MIN_CTX = 50_000
 const PING_PROMPT = 'Reply with the single word: warm'
 const TOOL = 'mcp__keepwarm__keepwarm'
@@ -1012,11 +1008,6 @@ async function ping($: EngineInterface, s: State) {
     return
   }
   if (now - s.lastRequestAt < s.every - 1000) return arm($, s) // a turn re-armed meanwhile
-  // Night ends a judged window (the person is asleep); background work wakes the session anyway.
-  if (s.thenCompact && !s.bg.length && (await asleep($, now))) {
-    await stop($, s, null)
-    return autoCompact($, s, '夜里 Mac 没人用，不再保温')
-  }
   if (wakesItself(s, now)) {
     // Its own wakeup will refresh the cache; ping only if that wakeup does not come.
     s.pending = $.clock.after(s.wakeAt + WAKE_MARGIN_MS / 2 - now, () => { void ping($, s) })
@@ -1287,11 +1278,6 @@ async function expireAdvice($: EngineInterface, s: State) {
 // The session's own scheduled wakeup fires while the cache is still warm, with time to spare.
 const wakesItself = (s: State, now: number) => s.wakeAt > now && s.wakeAt < s.lastRequestAt + TTL_MS - WAKE_MARGIN_MS
 
-async function asleep($: EngineInterface, now: number): Promise<boolean> {
-  const h = new Date(now).getHours()
-  return (h >= NIGHT_FROM || h < NIGHT_TO) && (await idleSeconds($)) >= ASLEEP_IDLE_S
-}
-
 // Compact with nobody asked and nobody told: the audit log records it.
 async function autoCompact($: EngineInterface, s: State, reason: string) {
   const now = await $.clock.now()
@@ -1329,7 +1315,7 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
   }
   if (!forced && s.bg.length && !(await overBudget($))) {
     // Waiting on background work it started, which wakes it when it reports: keep warm until then
-    // with no judge, day or night (the session itself comes back, not only the person).
+    // with no judge (the session itself comes back, not only the person).
     const what = s.bg.slice(0, 3).join('；')
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'keepwarm', reason: `后台任务在跑：${what}`, chosen: 'background', by: 'auto' })
     s.thenCompact = true
@@ -1359,17 +1345,18 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
   if (forced) {
     // /keepwarm check: the person asked, so show the advice and let them choose.
     if (a.action !== 'ignore') await offerAdvice($, s, a)
-  } else if (a.action === 'compact' || (a.action === 'keepwarm' && (await asleep($, now)))) {
-    // Nobody is asked or told (10-14): compact, also when the advice was to keep warm but the
-    // person has gone to bed and will be back only tomorrow. Not now, though: the judge just
-    // read the whole cache, so it holds another hour; compacting near its end costs the same
-    // and leaves that hour for the person to come back to the full context.
-    const night = a.action === 'keepwarm'
+  } else if (a.action === 'compact') {
+    // Nobody is asked or told (10-14): compact. Not now, though: the judge just read the whole
+    // cache, so it holds another hour; compacting near its end costs the same and leaves that
+    // hour for the person to come back to the full context.
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: a.action, reason: a.reason, chosen: 'compact-later', by: 'auto' })
     s.thenCompact = true
-    await startWindow($, s, s.lastRequestAt + PING_AFTER_MS - (await $.clock.now()), 'model', `空闲判断：${night ? '夜里 Mac 没人用，' : ''}compact，等这次判断续上的一小时快用完时再压`)
+    await startWindow($, s, s.lastRequestAt + PING_AFTER_MS - (await $.clock.now()), 'model', '空闲判断：compact，等这次判断续上的一小时快用完时再压')
     return
   } else if (a.action === 'keepwarm') {
+    // Kept warm at night too (10-15): an idle Mac at 1 a.m. is no sign of bed (the person often
+    // sleeps at 4 and is back about five hours later), and compacting then costs more than the
+    // pings it spares whenever they return inside the window.
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: 'keepwarm', reason: a.reason, chosen: 'keepwarm', by: 'auto' })
     s.thenCompact = true
     await startWindow($, s, s.turnAt + KEEP_UNTIL_MS - now, 'model', `空闲判断：保温到空闲 ${fmtDuration(KEEP_UNTIL_MS)}，之后 compact`)

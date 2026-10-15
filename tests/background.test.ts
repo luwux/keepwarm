@@ -4,8 +4,9 @@ const MIN = 60_000
 const CTX = 300_000
 
 // The engine beneath: a 300K session on Opus, an idle Mac, and a fork that counts its calls.
-function world(on: Parameters<Parameters<typeof test>[1]>[1], cwd = '/tmp/p', verdict = 'keepwarm', judgeMs = 0) {
-  const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 20, 0) })
+type World = { cwd?: string; verdict?: string; judgeMs?: number; now?: number; idleS?: number }
+function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', verdict = 'keepwarm', judgeMs = 0, now = Date.UTC(2026, 9, 14, 20, 0), idleS = 0 }: World = {}) {
+  const clock = mock.clock(on, { now })
   mock.store(on)
   const forks: string[] = []
   const compactions: number[] = []
@@ -24,7 +25,7 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], cwd = '/tmp/p', ve
   on('ui.log', async () => ({ value: undefined }) as never)
   on('session.usage', async () => ({ value: { context: { tokens: CTX, window: 1_000_000 } } }) as never)
   on('session.model', async () => ({ value: 'claude-opus-5-5' }))
-  on('process.run', async () => ({ value: { code: 0, stdout: '', stderr: '' } }) as never)
+  on('process.run', async () => ({ value: { exitCode: 0, stdout: `"HIDIdleTime" = ${idleS * 1e9}`, stderr: '' } }) as never) // ioreg: seconds since the last input
   on('session.compact', async () => {
     compactions.push(await clock.now())
     return { messages: [{ role: 'user', text: 'summary', toolUses: [] }] } as never
@@ -77,7 +78,7 @@ test('a background sleep is the session waking itself: no judge and no ping', { 
 })
 
 test('a session with no project (a chat) gets no idle check at all', { options: { idleCheck: 'judge' } }, async ($, on) => {
-  const { clock, forks } = world(on, '/Users/x/Library/Application Support/Claude/scratch-workspaces/a/b/scratch-2026-10-14-abc')
+  const { clock, forks } = world(on, { cwd: '/Users/x/Library/Application Support/Claude/scratch-workspaces/a/b/scratch-2026-10-14-abc' })
   await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
   await turn($, 'composer', '随便聊聊')
   await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 'a1', type: 'subagent', status: 'running', description: 'lookup' }] } as never)
@@ -108,7 +109,7 @@ test('a rewrite after the hour is one notice in Claude, and nothing shows under 
   on('process.run', async (_$, e) => {
     const argv = (e as { argv: string[] }).argv
     if (argv[0] === 'terminal-notifier') notices.push(argv.join(' '))
-    return { value: { code: 0, stdout: '', stderr: '' } } as never
+    return { value: { exitCode: 0, stdout: '', stderr: '' } } as never
   })
   on('turn.step', async function* (_$, e) {
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
@@ -135,7 +136,7 @@ test('a rewrite after the hour is one notice in Claude, and nothing shows under 
 })
 
 test('a judged compaction waits out the hour the judge refreshed, with no ping before it', { options: { idleCheck: 'judge' } }, async ($, on) => {
-  const { clock, forks, compactions } = world(on, '/tmp/p', 'compact', 8000) // the judge's fork takes 8 s, as it did (10-15)
+  const { clock, forks, compactions } = world(on, { verdict: 'compact', judgeMs: 8000 }) // the judge's fork takes 8 s, as it did (10-15)
   await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
   await turn($, 'composer', '先到这里')
   await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
@@ -149,4 +150,16 @@ test('a judged compaction waits out the hour the judge refreshed, with no ping b
   expect(forks).toEqual(['judge']) // no ping at the end of the hour
   expect(compactions).toHaveLength(1)
   expect(compactions[0] - start).toBeLessThan(50 * MIN + 56 * MIN) // inside the hour the judge refreshed
+})
+
+test('a session judged worth keeping warm stays warm at night, with the Mac idle', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  // 1 a.m. here, nobody at the Mac for two hours: no sign of bed (10-15, the person slept at 4).
+  const { clock, forks, compactions } = world(on, { now: new Date(2026, 9, 15, 1, 0).getTime(), idleS: 2 * 3600 })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '等我回来再接着看')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+
+  await clock.advance(3 * 60 * MIN)
+  expect(forks).toEqual(['judge', 'ping', 'ping']) // judged at 50 minutes, pinged at 105 and 160
+  expect(compactions).toEqual([])
 })
