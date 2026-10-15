@@ -960,6 +960,8 @@ async function pushLeaveSummary($: EngineInterface, s: State, la: KeepwarmLeaveA
 // Ten minutes before a keep-warm window ends: offer to extend it, once per window.
 async function endWarn($: EngineInterface, s: State) {
   s.endWarn = null
+  // A window the idle judge opened ends in a compaction by design: nothing to tell.
+  if (s.thenCompact) return
   const now = await $.clock.now()
   if (!s.deadline || s.endWarnedFor === s.deadline || s.deadline - now > END_WARN_MS + 1000 || isCold(s, now)) return
   s.endWarnedFor = s.deadline
@@ -975,7 +977,8 @@ async function ping($: EngineInterface, s: State) {
   s.pending = null
   if (!s.deadline) return
   const now = await $.clock.now()
-  if (now >= s.deadline) return arm($, s)
+  // A window that ends where a ping would be due (a judged compaction) ends there, no ping.
+  if (now >= s.deadline - 1000) return arm($, s)
   if (now - s.lastRequestAt < s.every - 1000) return arm($, s) // a turn re-armed meanwhile
   if (s.thenCompact && (await asleep($, now))) {
     await stop($, s, null)
@@ -1311,14 +1314,19 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     // /keepwarm check: the person asked, so show the advice and let them choose.
     if (a.action !== 'ignore') await offerAdvice($, s, a)
   } else if (a.action === 'compact' || (a.action === 'keepwarm' && (await asleep($, now)))) {
-    // Nobody is asked or told (10-14): compact now, also when the advice was to keep warm but
-    // the person has gone to bed and will be back only tomorrow.
-    return apply($, s, a.action === 'compact' ? a : { ...a, reason: `${a.reason}（夜里 Mac 没人用，直接 compact）` }, 'compact', 'auto')
+    // Nobody is asked or told (10-14): compact, also when the advice was to keep warm but the
+    // person has gone to bed and will be back only tomorrow. Not now, though: the judge just
+    // read the whole cache, so it holds another hour; compacting near its end costs the same
+    // and leaves that hour for the person to come back to the full context.
+    const night = a.action === 'keepwarm'
+    await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: a.action, reason: a.reason, chosen: 'compact-later', by: 'auto' })
+    s.thenCompact = true
+    await startWindow($, s, s.lastRequestAt + PING_AFTER_MS - now, 'model', `空闲判断：${night ? '夜里 Mac 没人用，' : ''}compact，等这次判断续上的一小时快用完时再压`)
+    return
   } else if (a.action === 'keepwarm') {
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: 'keepwarm', reason: a.reason, chosen: 'keepwarm', by: 'auto' })
-    await startWindow($, s, s.turnAt + KEEP_UNTIL_MS - now, 'model', `空闲判断：保温到空闲 ${fmtDuration(KEEP_UNTIL_MS)}，之后 compact`)
     s.thenCompact = true
-    await save($, s)
+    await startWindow($, s, s.turnAt + KEEP_UNTIL_MS - now, 'model', `空闲判断：保温到空闲 ${fmtDuration(KEEP_UNTIL_MS)}，之后 compact`)
     return
   } else {
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: 'ignore', reason: a.reason, chosen: 'ignore', by: 'auto' })

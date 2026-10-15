@@ -29,10 +29,12 @@ and speaks up *before* the hour runs out.
   above `remindMinContext`). With `idleCheck: judge` a fork of the session decides whether to
   compact, keep warm or leave it; the fork reads the cache (about $0.03–0.10 at 100–400K tokens)
   and refreshes it. Then, with no notification:
-  - compact: the session is compacted at once;
+  - compact: the session is compacted about 55 minutes later, when the hour the judge's own
+    read bought is nearly over; it costs the same, and coming back before then keeps the full
+    context;
   - keep warm: the cache is kept warm until 6 hours after the last turn, then the session is
     compacted; writing in the session ends this. At night (22:00–07:00 with no keyboard or mouse
-    input on the Mac for 30 minutes) it is compacted at once instead;
+    input on the Mac for 30 minutes) it is compacted like a compact verdict instead;
   - leave it: nothing.
 
   Six hours comes from two weeks of the author's sessions: daytime returns came within six hours
