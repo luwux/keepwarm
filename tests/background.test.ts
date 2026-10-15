@@ -78,10 +78,12 @@ test('a session with no project (a chat) gets no idle check at all', { options: 
   expect(forks).toEqual([])
 })
 
-test('a cold write after the hour sends one Mac notification', { options: { idleCheck: 'off' } }, async ($, on) => {
+test('a lapsed cache shows in the footer, and its rewrite in one notice in Claude only', { options: { idleCheck: 'off' } }, async ($, on) => {
   const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 20, 0) })
   mock.store(on)
   const notices: string[] = []
+  const toasts: string[] = []
+  const footer: Array<string | undefined> = []
   let usage = { cache_read_input_tokens: CTX, cache_creation_input_tokens: 0, input_tokens: 10, output_tokens: 100, model: 'claude-opus-5-5' }
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('session.id', async () => ({ value: 'sid-2' }))
@@ -93,8 +95,8 @@ test('a cold write after the hour sends one Mac notification', { options: { idle
   on('turn.complete', async () => ({ text: '' }))
   on('session.usage', async () => ({ value: { context: { tokens: CTX, window: 1_000_000 } } }) as never)
   on('session.model', async () => ({ value: 'claude-opus-5-5' }))
-  on('ui.status', async () => ({ value: undefined }) as never)
-  on('ui.toast', async () => ({ value: undefined }) as never)
+  on('ui.status', async (_$, e) => { footer.push((e as { text?: string }).text); return { value: undefined } as never })
+  on('ui.toast', async (_$, e) => { toasts.push((e as { text: string }).text); return { value: undefined } as never })
   on('ui.log', async () => ({ value: undefined }) as never)
   on('process.run', async (_$, e) => {
     const argv = (e as { argv: string[] }).argv
@@ -112,12 +114,15 @@ test('a cold write after the hour sends one Mac notification', { options: { idle
   await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
   await step('第一条')
   await step('一分钟后，热的')
-  expect(notices).toEqual([])
+  expect(toasts).toEqual([])
+  expect(footer.at(-1)).toBeUndefined()
 
   await clock.advance(2 * 60 * MIN)
+  expect(footer.at(-1)).toContain('缓存已冷 1h') // the minute tick redraws it while nobody types
   usage = { ...usage, cache_read_input_tokens: 40_000, cache_creation_input_tokens: CTX - 40_000 }
   await step('两小时后回来')
-  expect(notices.length).toBe(1)
-  expect(notices[0]).toContain('冷写入')
-  expect(notices[0]).toContain('缓存过期')
+  expect(toasts.filter(x => x.startsWith('冷写入'))).toHaveLength(1)
+  expect(toasts.at(-1)).toContain('缓存过期')
+  expect(notices).toEqual([]) // no Mac notification
+  expect(footer.at(-1)).toBeUndefined() // warm again
 })

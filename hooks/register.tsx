@@ -214,11 +214,12 @@ function forkUsd(u: Usage, p: [number, number, number] | null): number | null {
 // A warm fork reads the prefix and writes only its own tail; a big write means the prefix broke.
 const forkWasWarm = (u: Usage) => u.cache_read_input_tokens > 0 && u.cache_creation_input_tokens < 0.1 * u.cache_read_input_tokens
 
-// The footer line: when this session's cache lapses, counted from the last request of any
-// kind (a turn, a judging fork, a ping), since each cache hit restarts the hour.
-// Nothing in the status line (10-14): the person need not watch the cache; /keepwarm shows it.
-function statusText(_s: State, _now: number): string | undefined {
-  return undefined
+// The footer line, shown only once the cache has lapsed (10-14): how long ago, and what the next
+// message rewrites. The hour runs from the last request of any kind (a turn, a judging fork, a
+// ping), since each cache hit restarts it.
+function statusText(s: State, now: number): string | undefined {
+  if (s.compacted || s.ctx < GUARD_MIN_CTX || !isCold(s, now)) return undefined
+  return `缓存已冷 ${fmtDuration(now - s.lastRequestAt - TTL_MS)}，下一条消息重写约 ${fmtUsd(coldUsd(s))}`
 }
 
 // Each label is two Chinese characters and a full-width space, so the lines stay aligned in the
@@ -735,9 +736,14 @@ async function checkMiss($: EngineInterface, s: State, u: TurnUsage, prevAt: num
   const miss: Miss = { at: now, tokens: write, usd: p ? write * p[1] / 1e6 : null, cause, gapMs }
   s.misses.push(miss)
   await appendLog($, 'misses', { sid: s.sid, cwd: s.cwd, model: u.model, ...miss })
-  // Every real rewrite gets a Mac notification, nothing on the phone (asked for 10-14).
+  // Every real rewrite gets a notice in Claude, nothing outside it (asked for 10-14).
   const by = s.turnBy === 'person' ? '' : s.turnBy === 'task-notification' ? '，后台任务回报时' : `，${s.turnBy} 触发`
-  await notify($, s, '冷写入', `重写 ${fmtTok(write)} tokens，约 ${fmtUsd(miss.usd)}（${MISS_ZH[cause]}${prevAt ? `，距上次请求 ${fmtDuration(gapMs)}` : ''}${by}）`)
+  const what = `${fmtTok(write)} tokens，约 ${fmtUsd(miss.usd)}`
+  $.ui.toast(
+    cause === 'other' ? `意外整段重写 ${what}：同一模型、距上次请求只有 ${fmtDuration(gapMs)}，可能是系统提示或工具列表变了${by}`
+    : cause === 'expired' && s.deadline ? `保温期间缓存过期，重写 ${what}（距上次请求 ${fmtDuration(gapMs)}${by}）`
+    : `冷写入 ${what}（${MISS_ZH[cause]}${prevAt ? `，距上次请求 ${fmtDuration(gapMs)}` : ''}${by}）`,
+  )
   if (cause === 'other') {
     await alarm($, s, 'unexplained', '缓存被意外整段重写', `同一模型、距上次请求只有 ${fmtDuration(gapMs)}，仍整段重写了 ${fmtTok(write)} tokens（约 ${fmtUsd(miss.usd)}）。可能是系统提示或工具列表变了，或者回退、编辑了历史消息。`)
   } else if (cause === 'expired' && s.deadline) {
