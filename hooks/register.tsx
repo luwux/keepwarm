@@ -67,6 +67,7 @@ const ASLEEP_IDLE_S = 30 * 60
 const GUARD_MIN_CTX = 50_000
 const PING_PROMPT = 'Reply with the single word: warm'
 const TOOL = 'mcp__keepwarm__keepwarm'
+const NOT_THE_PERSON = new Set(['plugin', 'task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'coordinator', 'observer', 'observer-activity', 'auto-continuation', 'slack-ping', 'projects-relay', 'channel'])
 const LOG_MAX = 500
 
 // $ per million tokens: [cache read, 1h cache write, output], list prices September 2026.
@@ -1630,8 +1631,12 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
+    // A turn something else started (a background task done, a schedule, another session) is not
+    // the person coming back: it neither answers a reminder nor ends their absence's window.
+    // Seen 10-14: a subagent's notice ended a window the person was away for.
+    const person = !NOT_THE_PERSON.has(e.origin.kind)
     // The person is back: an unanswered reminder is moot.
-    if (e.origin.kind !== 'plugin' && (await read($, advice))) {
+    if (person && (await read($, advice))) {
       const a = await read($, advice)
       if (a) await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: a.ctx, advised: a.action, reason: a.reason, chosen: 'returned', by: 'user' })
       await update($, advice, () => null)
@@ -1639,7 +1644,7 @@ export const register: Register = (on, options) => {
     // The person is back: the absence a reminder's or the model's window covered is over. A
     // window opened with /keepwarm on runs its hours whatever they do (while they work their own
     // requests keep the cache warm and no ping goes out); only /keepwarm off ends it.
-    if (e.origin.kind !== 'plugin' && s.deadline && !s.sticky && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) {
+    if (person && s.deadline && !s.sticky && typeof e.text === 'string' && !e.text.trimStart().startsWith('/')) {
       await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: await $.clock.now(), ctx: s.ctx, advised: 'keepwarm', reason: s.reason, chosen: 'returned-stop', by: 'user' })
       await stop($, s, null)
       s.stopped = null
