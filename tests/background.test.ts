@@ -4,8 +4,8 @@ const MIN = 60_000
 const CTX = 300_000
 
 // The engine beneath: a 300K session on Opus, an idle Mac, and a fork that counts its calls.
-type World = { cwd?: string; verdict?: string; judgeMs?: number; now?: number; idleS?: number; store?: Record<string, unknown> }
-function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', verdict = 'keepwarm', judgeMs = 0, now = Date.UTC(2026, 9, 14, 20, 0), idleS = 0, store = {} }: World = {}) {
+type World = { cwd?: string; verdict?: string; judgeMs?: number; now?: number; idleS?: number; store?: Record<string, unknown>; ctx?: number; power?: { dark: boolean } }
+function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', verdict = 'keepwarm', judgeMs = 0, now = Date.UTC(2026, 9, 14, 20, 0), idleS = 0, store = {}, ctx = CTX, power = { dark: false } }: World = {}) {
   const clock = mock.clock(on, { now })
   mock.store(on, store)
   const forks: string[] = []
@@ -25,9 +25,13 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', 
   on('ui.status', async () => ({ value: undefined }) as never)
   on('ui.toast', async () => ({ value: undefined }) as never)
   on('ui.log', async (_$, e) => { logs.push((e as { text: string }).text); return { value: undefined } as never })
-  on('session.usage', async () => ({ value: { context: { tokens: CTX, window: 1_000_000 } } }) as never)
+  on('session.usage', async () => ({ value: { context: { tokens: ctx, window: 1_000_000 } } }) as never)
   on('session.model', async () => ({ value: 'claude-opus-5-5' }))
-  on('process.run', async () => ({ value: { exitCode: 0, stdout: `"HIDIdleTime" = ${idleS * 1e9}`, stderr: '' } }) as never) // ioreg: seconds since the last input
+  on('process.run', async (_$, e) => {
+    // pmset: a dark wake has no graphics; ioreg: seconds since the last input
+    if ((e as { argv: string[] }).argv[0] === 'pmset') return { value: { exitCode: 0, stdout: `Current System Capabilities are: CPU ${power.dark ? 'Disk' : 'Graphics Audio'} Network \n`, stderr: '' } } as never
+    return { value: { exitCode: 0, stdout: `"HIDIdleTime" = ${idleS * 1e9}`, stderr: '' } } as never
+  })
   on('session.compact', async () => {
     compactions.push(await clock.now())
     return { messages: [{ role: 'user', text: 'summary', toolUses: [] }] } as never
@@ -184,4 +188,54 @@ test('a rewound session nothing kept warm is told its cache is cold', async ($, 
   await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
   await $.classic.SessionStart(fork as never)
   expect(logs.filter(x => x.includes('缓存已冷'))).toHaveLength(1)
+})
+
+test('a session under the 200K threshold is left alone: no judge, no ping, no compaction', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const { clock, forks, compactions } = world(on, { ctx: 190_000 })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '跑一个 3 小时的评测')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 'a1', type: 'subagent', status: 'running', description: 'Test-set eval' }] } as never)
+  await clock.advance(13 * 60 * MIN)
+  expect(forks).toEqual([])
+  expect(compactions).toEqual([])
+})
+
+// The lid closed: the Mac wakes for seconds of maintenance and sleeps again; a request sent then is
+// retried on the full wake, after the cache lapsed (10-15, a judge that wrote 404K tokens).
+test('nothing is sent during a dark wake; the judge waits for the full wake', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const power = { dark: true }
+  const { clock, forks } = world(on, { power })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '等我回来')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+  await clock.advance(53 * MIN)
+  expect(forks).toEqual([])
+  power.dark = false
+  await clock.advance(2 * MIN)
+  expect(forks).toEqual(['judge'])
+})
+
+test('a keep-warm ping is held during a dark wake and goes out on the full wake', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const power = { dark: false }
+  const { clock, forks } = world(on, { power })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '等我回来')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+  await clock.advance(51 * MIN)
+  expect(forks).toEqual(['judge'])
+  power.dark = true
+  await clock.advance(56 * MIN)
+  expect(forks).toEqual(['judge'])
+  power.dark = false
+  await clock.advance(2 * MIN)
+  expect(forks).toEqual(['judge', 'ping'])
+})
+
+test('a watch on a published artifact is not background work: the session is judged as usual', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const { clock, forks } = world(on)
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '发布好了')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 'w1', type: 'monitor', status: 'running', description: 'live updates for artifact https://claude.ai/artifact/x (republishes, comments)' }] } as never)
+  await clock.advance(51 * MIN)
+  expect(forks).toEqual(['judge'])
 })

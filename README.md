@@ -26,8 +26,9 @@ and speaks up *before* the hour runs out.
 ## What it does
 
 - **Idle check, handled without asking** (~50 minutes after the last turn, only for sessions
-  above `remindMinContext`, 100K by default). If background work the session started (a shell,
-  a subagent, a monitor) is still running, nothing is judged: that work wakes the session when it
+  above `remindMinContext`, 200K by default; smaller ones get no judge, no ping and no
+  compaction). If background work the session started (a shell,
+  a subagent, a monitor; not a watch on a published artifact) is still running, nothing is judged: that work wakes the session when it
   reports, so the cache is kept warm until then, at most 12 hours after the last turn (then the
   session is compacted); in fifteen days of the author's sessions 80% of such waits reported
   within 6 hours and 92% within 12. Otherwise, with `idleCheck: judge` a fork of
@@ -73,6 +74,9 @@ and speaks up *before* the hour runs out.
   limit reached, or keepwarm's own daily budget (`dailyBudgetUsd`, $10) exceeded.
 - **Leaving**: `/keepwarm leave 2h` asks every live, warm session for its own verdict and shows
   one summary.
+- **Not while the Mac sleeps**: with the lid closed the Mac wakes for seconds now and then; no
+  judge or ping goes out then, since the sleep that follows cuts it and it is sent again after the
+  cache has lapsed.
 - **Never blocks** a prompt unless you turn `guard refuse` on.
 
 ## Every request is accounted for

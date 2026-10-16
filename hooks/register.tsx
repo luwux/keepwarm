@@ -28,9 +28,10 @@ type Idle = 'off' | 'notify' | 'judge'
 const cfg = {
   // A JSON file {"server": "https://ntfy.sh", "topic": "..."}; empty means no phone push.
   ntfyConfigFile: '',
-  // Below this a cold rewrite costs too little to judge (100K on Opus: about $0.5). It was 250K
-  // while the check interrupted the person; since 0.8.0 nothing does (10-14).
-  remindMinCtx: 100_000,
+  // Below this a session is left alone: no judge, no ping, no compaction; it keeps its whole
+  // context and pays a rewrite when the person comes back late. The person's choice (10-16), from
+  // 100K: over fifteen days handling the 100-200K band saved about $107 against 48 compactions.
+  remindMinCtx: 200_000,
   awayIdleS: 5 * 60,
   // A safety net against a runaway timer: per session, at most pingLimit pings in any
   // pingLimitHours (one every 55 minutes is 13 in 12 hours).
@@ -73,6 +74,10 @@ const BG_KEEP_MS = 12 * 60 * 60 * 1000
 // A background shell that starts by sleeping is the session's own alarm clock: sessions use
 // `sleep 3300` because ScheduleWakeup fires only under /loop.
 const SELF_WAKE = /^\s*sleep\s+(\d+(?:\.\d+)?)\s*(?:$|[;&|\n])/
+// A watch on a published artifact ("live updates for artifact …") is listed as background work but
+// runs until stopped and reports only if someone comments: no sign the session will be woken
+// (10-16: two sessions kept warm twelve hours overnight for one).
+const WATCH = /^live updates for /i
 const GUARD_MIN_CTX = 50_000
 const PING_PROMPT = 'Reply with the single word: warm'
 const TOOL = 'mcp__keepwarm__keepwarm'
@@ -396,6 +401,19 @@ async function idleSeconds($: EngineInterface): Promise<number> {
     return m ? Number(m[1]) / 1e9 : 0
   } catch {
     return 0
+  }
+}
+
+// A dark wake: the lid is closed and the Mac wakes for a few seconds of maintenance, then sleeps
+// again. A request sent then is cut by the sleep and retried on the next full wake, maybe after
+// the cache has lapsed (10-15: a judge sent at 12:23 went out again at 12:54 and wrote 404K
+// tokens, $3.25). A full wake has graphics; a display that is merely off keeps them.
+async function darkWake($: EngineInterface): Promise<boolean> {
+  try {
+    const r = await $.process.run(['pmset', '-g', 'systemstate'])
+    return /Capabilities are:/.test(r.stdout) && !/Graphics/.test(r.stdout)
+  } catch {
+    return false
   }
 }
 
@@ -1029,6 +1047,11 @@ async function ping($: EngineInterface, s: State) {
     return
   }
   if (isCold(s, now)) return lapsedWindow($, s, s.deadline, '电脑睡眠或进程暂停超过 1 小时，ping 没能按时发出')
+  if (await darkWake($)) {
+    // Asleep but for a moment: try again; on the full wake the timer fires late and finds out.
+    s.pending = $.clock.after(60_000, () => { void ping($, s) })
+    return
+  }
   if (s.last && now - s.last.at < PING_MIN_GAP_MS) {
     s.pending = $.clock.after(s.last.at + PING_MIN_GAP_MS - now, () => { void ping($, s) })
     return
@@ -1303,6 +1326,10 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
   s.check = null
   const now = await $.clock.now()
   if (!forced && (s.deadline || isCold(s, now) || s.compacted || now - s.lastRequestAt < CHECK_AFTER_MS - 1000)) return arm($, s)
+  if (!forced && (await darkWake($))) {
+    s.check = $.clock.after(60_000, () => { void idleCheck($, s) })
+    return
+  }
   s.checkedFor = s.turnAt
   if (!forced && wakesItself(s, now)) {
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'ignore', reason: `会话定好了 ${fmtDuration(s.wakeAt - now)} 后自己醒来`, chosen: 'self-wake', by: 'auto' })
@@ -1563,7 +1590,7 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     if (e.agent_id) return r
     const tasks = e.background_tasks ?? []
-    s.bg = tasks.map(t => (t.description || t.command || t.type).slice(0, 80))
+    s.bg = tasks.filter(t => !WATCH.test(t.description ?? '')).map(t => (t.description || t.command || t.type).slice(0, 80))
     // A sleeping shell no longer listed was stopped: its wakeup will not come.
     if (s.wakeBySleep && e.background_tasks && !tasks.some(t => SELF_WAKE.test(t.command ?? ''))) {
       s.wakeAt = 0
