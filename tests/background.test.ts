@@ -4,11 +4,12 @@ const MIN = 60_000
 const CTX = 300_000
 
 // The engine beneath: a 300K session on Opus, an idle Mac, and a fork that counts its calls.
-type World = { cwd?: string; verdict?: string; judgeMs?: number; now?: number; idleS?: number }
-function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', verdict = 'keepwarm', judgeMs = 0, now = Date.UTC(2026, 9, 14, 20, 0), idleS = 0 }: World = {}) {
+type World = { cwd?: string; verdict?: string; judgeMs?: number; now?: number; idleS?: number; store?: Record<string, unknown> }
+function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', verdict = 'keepwarm', judgeMs = 0, now = Date.UTC(2026, 9, 14, 20, 0), idleS = 0, store = {} }: World = {}) {
   const clock = mock.clock(on, { now })
-  mock.store(on)
+  mock.store(on, store)
   const forks: string[] = []
+  const logs: string[] = []
   const compactions: number[] = []
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('session.id', async () => ({ value: 'sid-1' }))
@@ -20,9 +21,10 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', 
   on('turn.complete', async () => ({ text: '' }))
   on('tool.call', async () => ({ result: 'Command running in background with ID: b1.' }) as never)
   on('classic.Stop', async () => ({}))
+  on('classic.SessionStart', async () => ({}))
   on('ui.status', async () => ({ value: undefined }) as never)
   on('ui.toast', async () => ({ value: undefined }) as never)
-  on('ui.log', async () => ({ value: undefined }) as never)
+  on('ui.log', async (_$, e) => { logs.push((e as { text: string }).text); return { value: undefined } as never })
   on('session.usage', async () => ({ value: { context: { tokens: CTX, window: 1_000_000 } } }) as never)
   on('session.model', async () => ({ value: 'claude-opus-5-5' }))
   on('process.run', async () => ({ value: { exitCode: 0, stdout: `"HIDIdleTime" = ${idleS * 1e9}`, stderr: '' } }) as never) // ioreg: seconds since the last input
@@ -36,7 +38,7 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', 
     if (judge && judgeMs) await clock.sleep(judgeMs)
     return { value: { isAnswered: true, text: `{"action":"${verdict}","topic":"t","reason":"r","hours":3}`, usage: { cache_read_input_tokens: CTX, cache_creation_input_tokens: 0, input_tokens: 16, output_tokens: 4 } } } as never
   })
-  return { clock, forks, compactions }
+  return { clock, forks, compactions, logs }
 }
 
 async function turn($: Parameters<Parameters<typeof test>[1]>[0], kind: string, text: string) {
@@ -162,4 +164,24 @@ test('a session judged worth keeping warm stays warm at night, with the Mac idle
   await clock.advance(3 * 60 * MIN)
   expect(forks).toEqual(['judge', 'ping', 'ping']) // judged at 50 minutes, pinged at 105 and 160
   expect(compactions).toEqual([])
+})
+
+// A rewind starts the conversation again under a new id; the engine dates its cache from the
+// transcript's last response, 2h20m back, but keepwarm pinged the original 36 minutes ago (10-16).
+const NOW = Date.UTC(2026, 9, 16, 7, 11)
+const fork = { stop_hook_active: false, source: 'fork', seconds_since_last_response: 8460, context_tokens: CTX, prompt_cache_likely_expired: true, estimated_cache_write_usd: 2.08 }
+
+test('a rewound session whose original keepwarm pinged within the hour is not told its cache is cold', async ($, on) => {
+  const parent = { lastRequestAt: NOW - 36 * MIN, turnAt: NOW - 141 * MIN, ctx: CTX, window: 1_000_000, model: 'claude-opus-5-5', compacted: false }
+  const { logs } = world(on, { now: NOW, store: { 'rt:sid-parent': parent } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await $.classic.SessionStart(fork as never)
+  expect(logs.filter(x => x.includes('缓存已冷'))).toEqual([])
+})
+
+test('a rewound session nothing kept warm is told its cache is cold', async ($, on) => {
+  const { logs } = world(on, { now: NOW })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await $.classic.SessionStart(fork as never)
+  expect(logs.filter(x => x.includes('缓存已冷'))).toHaveLength(1)
 })

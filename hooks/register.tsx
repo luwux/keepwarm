@@ -849,6 +849,21 @@ async function saveRuntime($: EngineInterface, s: State) {
   await $.store.set(`rt:${s.sid}`, rt)
 }
 
+// The last read of this conversation's cache that keepwarm knows of: this session's own record,
+// or the one a rewind or fork came from (another id, the same context within 1%). The engine
+// dates a resumed cache from the transcript's last response and knows nothing of the pings and
+// judges since (10-16: a rewound session was told 417K would be rewritten; it read all 417K).
+async function lastKnownRead($: EngineInterface, s: State, ctx: number): Promise<number> {
+  let at = 0
+  for (const k of await $.store.keys()) {
+    if (!k.startsWith('rt:')) continue
+    const rt = (await $.store.get(k)) as Runtime | undefined
+    if (!rt || rt.compacted) continue
+    if ((k === `rt:${s.sid}` || Math.abs(rt.ctx - ctx) <= ctx * 0.01) && rt.lastRequestAt > at) at = rt.lastRequestAt
+  }
+  return at
+}
+
 async function loadRuntime($: EngineInterface, s: State, now: number) {
   for (const k of await $.store.keys()) {
     if (!k.startsWith('rt:') || k === `rt:${s.sid}`) continue
@@ -1498,10 +1513,14 @@ export const register: Register = (on, options) => {
     }
     if (e.source === 'resume' || e.source === 'fork') {
       if (typeof e.context_tokens === 'number' && e.context_tokens > 0) s.ctx = e.context_tokens
-      if (typeof e.seconds_since_last_response === 'number') s.turnAt = s.lastRequestAt = (await $.clock.now()) - e.seconds_since_last_response * 1000
+      const now = await $.clock.now()
+      if (typeof e.seconds_since_last_response === 'number') {
+        s.turnAt = now - e.seconds_since_last_response * 1000
+        s.lastRequestAt = Math.max(s.turnAt, await lastKnownRead($, s, s.ctx))
+      }
       if (typeof e.model === 'string') s.lastModel = e.model
       s.compacted = false
-      if (e.prompt_cache_likely_expired === true && s.ctx >= GUARD_MIN_CTX && s.guard !== 'off') {
+      if (e.prompt_cache_likely_expired === true && isCold(s, now) && s.ctx >= GUARD_MIN_CTX && s.guard !== 'off') {
         const usd = typeof e.estimated_cache_write_usd === 'number' ? fmtUsd(e.estimated_cache_write_usd) : fmtUsd(coldUsd(s))
         $.ui.log(`keepwarm：恢复的会话缓存已冷，第一条消息会重写 ${fmtTok(s.ctx)} tokens，约 ${usd}。只需要结论的话，可以先 /compact 或 /clear 后贴摘要。`)
       }
