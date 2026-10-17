@@ -78,6 +78,7 @@ const SELF_WAKE = /^\s*sleep\s+(\d+(?:\.\d+)?)\s*(?:$|[;&|\n])/
 // runs until stopped and reports only if someone comments: no sign the session will be woken
 // (10-16: two sessions kept warm twelve hours overnight for one).
 const WATCH = /^live updates for /i
+const ACTIVE = /^(running|pending)$/i
 const GUARD_MIN_CTX = 50_000
 const PING_PROMPT = 'Reply with the single word: warm'
 const TOOL = 'mcp__keepwarm__keepwarm'
@@ -868,16 +869,19 @@ async function saveRuntime($: EngineInterface, s: State) {
 }
 
 // The last read of this conversation's cache that keepwarm knows of: this session's own record,
-// or the one a rewind or fork came from (another id, the same context within 1%). The engine
-// dates a resumed cache from the transcript's last response and knows nothing of the pings and
-// judges since (10-16: a rewound session was told 417K would be rewritten; it read all 417K).
-async function lastKnownRead($: EngineInterface, s: State, ctx: number): Promise<number> {
+// or, for a fork (a rewind starts one under a new id), the record of the session it came from:
+// the same last turn and the same context. The engine dates a resumed cache from the transcript's
+// last response and knows nothing of the pings and judges since (10-16: a rewound session was told
+// 417K would be rewritten; it read all 417K). Context size alone is no proof: on 10-17 a resumed
+// session took another's ping, 50 minutes after its own cache had lapsed, for its own.
+async function lastKnownRead($: EngineInterface, s: State, ctx: number, turnAt: number, fork: boolean): Promise<number> {
   let at = 0
   for (const k of await $.store.keys()) {
     if (!k.startsWith('rt:')) continue
     const rt = (await $.store.get(k)) as Runtime | undefined
     if (!rt || rt.compacted) continue
-    if ((k === `rt:${s.sid}` || Math.abs(rt.ctx - ctx) <= ctx * 0.01) && rt.lastRequestAt > at) at = rt.lastRequestAt
+    const parent = fork && Math.abs(rt.ctx - ctx) <= ctx * 0.01 && Math.abs(rt.turnAt - turnAt) <= 2 * 60_000
+    if ((k === `rt:${s.sid}` || parent) && rt.lastRequestAt > at) at = rt.lastRequestAt
   }
   return at
 }
@@ -1313,6 +1317,34 @@ async function expireAdvice($: EngineInterface, s: State) {
   await update($, advice, () => null)
 }
 
+// The first time within (from, to] a five-field cron expression fires, in local time, else 0.
+// Fields: *, n, a-b, lists, and /step on any of them; day of month and of week match either when
+// both are restricted, as cron does.
+function cronFire(expr: string, from: number, to: number): number {
+  const f = expr.trim().split(/\s+/)
+  const [mi = '', ho = '', dm = '', mo = '', dw = ''] = f
+  if (f.length !== 5) return 0
+  const match = (field: string, v: number, lo: number, hi: number) => field.split(',').some(part => {
+    const [range = '', stepS] = part.split('/')
+    const step = stepS ? Number(stepS) : 1
+    let a = lo, b = hi
+    if (range !== '*') {
+      const [x = NaN, y] = range.split('-').map(Number)
+      a = x
+      b = y ?? (stepS ? hi : x)
+    }
+    return Number.isFinite(a) && Number.isFinite(b) && step > 0 && v >= a && v <= b && (v - a) % step === 0
+  })
+  for (let t = Math.floor(from / 60_000) * 60_000 + 60_000; t <= to; t += 60_000) {
+    const d = new Date(t)
+    const dom = match(dm, d.getDate(), 1, 31)
+    const dow = match(dw, d.getDay(), 0, 7) || (d.getDay() === 0 && match(dw, 7, 0, 7))
+    const day = dm !== '*' && dw !== '*' ? dom || dow : dom && dow
+    if (day && match(mi, d.getMinutes(), 0, 59) && match(ho, d.getHours(), 0, 23) && match(mo, d.getMonth() + 1, 1, 12)) return t
+  }
+  return 0
+}
+
 // The session's own scheduled wakeup fires while the cache is still warm, with time to spare.
 const wakesItself = (s: State, now: number) => s.wakeAt > now && s.wakeAt < s.lastRequestAt + TTL_MS - WAKE_MARGIN_MS
 
@@ -1333,7 +1365,10 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
   s.checkedFor = s.turnAt
   if (!forced && wakesItself(s, now)) {
     await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'ignore', reason: `会话定好了 ${fmtDuration(s.wakeAt - now)} 后自己醒来`, chosen: 'self-wake', by: 'auto' })
-    return arm($, s)
+    // If the wakeup does not come (its shell was stopped, or the app does not fire it), look again
+    // just after it was due, while the cache still holds; the wakeup's own turn cancels this.
+    s.check = $.clock.after(Math.max(1000, s.wakeAt + WAKE_MARGIN_MS / 2 - now), () => { void idleCheck($, s) })
+    return
   }
   if (!forced && cfg.skipGroups.length) {
     const group = await sidebarGroup($, s)
@@ -1539,11 +1574,17 @@ export const register: Register = (on, options) => {
       return r
     }
     if (e.source === 'resume' || e.source === 'fork') {
+      // A new process: the background work of the one before died with it (the engine says so with
+      // a "didn't finish before the previous session ended" notification), so nothing will report.
+      // Only a hot reload keeps the list from the store (10-17: a restarted session would otherwise
+      // have been kept warm twelve hours for shells that were gone).
+      s.bg = []
+      await $.store.delete(key(s, 'bg'))
       if (typeof e.context_tokens === 'number' && e.context_tokens > 0) s.ctx = e.context_tokens
       const now = await $.clock.now()
       if (typeof e.seconds_since_last_response === 'number') {
         s.turnAt = now - e.seconds_since_last_response * 1000
-        s.lastRequestAt = Math.max(s.turnAt, await lastKnownRead($, s, s.ctx))
+        s.lastRequestAt = Math.max(s.turnAt, await lastKnownRead($, s, s.ctx, s.turnAt, e.source === 'fork'))
       }
       if (typeof e.model === 'string') s.lastModel = e.model
       s.compacted = false
@@ -1590,7 +1631,17 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     if (e.agent_id) return r
     const tasks = e.background_tasks ?? []
-    s.bg = tasks.filter(t => !WATCH.test(t.description ?? '')).map(t => (t.description || t.command || t.type).slice(0, 80))
+    // Work that will report: running or queued, and not a watch. An idle teammate waits for work
+    // and wakes nobody.
+    s.bg = tasks.filter(t => ACTIVE.test(t.status) && !WATCH.test(t.description ?? '')).map(t => (t.description || t.command || t.type).slice(0, 80))
+    // A cron of the session's own (CronCreate, /loop, ScheduleWakeup) that fires before the cache
+    // lapses is a wakeup like ScheduleWakeup's.
+    const now = await $.clock.now()
+    const cronAt = (e.session_crons ?? []).map(c => cronFire(c.schedule, now, now + TTL_MS)).filter(t => t > 0).sort((a, b) => a - b)[0] ?? 0
+    if (cronAt && !(s.wakeAt > now && s.wakeAt <= cronAt)) {
+      s.wakeAt = cronAt
+      s.wakeBySleep = false
+    }
     // A sleeping shell no longer listed was stopped: its wakeup will not come.
     if (s.wakeBySleep && e.background_tasks && !tasks.some(t => SELF_WAKE.test(t.command ?? ''))) {
       s.wakeAt = 0

@@ -183,6 +183,23 @@ test('a rewound session whose original keepwarm pinged within the hour is not to
   expect(logs.filter(x => x.includes('缓存已冷'))).toEqual([])
 })
 
+test('a resumed session does not take another session of the same size for its own', async ($, on) => {
+  // Another conversation, about as large, pinged 20 minutes ago; this one last answered 70 minutes ago.
+  const other = { lastRequestAt: NOW - 20 * MIN, turnAt: NOW - 3 * 60 * MIN, ctx: CTX + 1000, window: 1_000_000, model: 'claude-opus-5-5', compacted: false }
+  const { logs } = world(on, { now: NOW, store: { 'rt:sid-other': other } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await $.classic.SessionStart({ ...fork, source: 'resume', seconds_since_last_response: 70 * 60 } as never)
+  expect(logs.filter(x => x.includes('缓存已冷'))).toHaveLength(1)
+})
+
+test('a fork does not take a session with another last turn for its parent', async ($, on) => {
+  const other = { lastRequestAt: NOW - 20 * MIN, turnAt: NOW - 3 * 60 * MIN, ctx: CTX, window: 1_000_000, model: 'claude-opus-5-5', compacted: false }
+  const { logs } = world(on, { now: NOW, store: { 'rt:sid-other': other } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await $.classic.SessionStart(fork as never)
+  expect(logs.filter(x => x.includes('缓存已冷'))).toHaveLength(1)
+})
+
 test('a rewound session nothing kept warm is told its cache is cold', async ($, on) => {
   const { logs } = world(on, { now: NOW })
   await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
@@ -236,6 +253,60 @@ test('a watch on a published artifact is not background work: the session is jud
   await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
   await turn($, 'composer', '发布好了')
   await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 'w1', type: 'monitor', status: 'running', description: 'live updates for artifact https://claude.ai/artifact/x (republishes, comments)' }] } as never)
+  await clock.advance(51 * MIN)
+  expect(forks).toEqual(['judge'])
+})
+
+test('after a restart the background work of the old process is not waited for', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const now = Date.UTC(2026, 9, 17, 10, 0)
+  const rt = { lastRequestAt: now - 2 * MIN, turnAt: now - 2 * MIN, ctx: CTX, window: 1_000_000, model: 'claude-opus-5-5', compacted: false }
+  const { clock, forks } = world(on, { now, store: { 'rt:sid-1': rt, 'bg:sid-1': ['Wait for G1 s0 to finish'] } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await $.classic.SessionStart({ ...fork, source: 'resume', seconds_since_last_response: 120, prompt_cache_likely_expired: false } as never)
+  await clock.advance(49 * MIN)
+  expect(forks).toEqual(['judge']) // judged as idle, not kept warm for a shell that died
+})
+
+// The session's own cron: a one-shot wakeup 55 minutes on (as ScheduleWakeup records one), in local time.
+function cronAt(ms: number) {
+  const d = new Date(ms)
+  return `${d.getMinutes()} ${d.getHours()} ${d.getDate()} ${d.getMonth() + 1} *`
+}
+
+test('a cron of its own that fires before the cache lapses: no judge, no ping', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const now = Date.UTC(2026, 9, 17, 10, 0)
+  const { clock, forks } = world(on, { now })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '一小时内再看一次')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [], session_crons: [{ id: 'c1', schedule: cronAt(now + 55 * MIN), recurring: false, prompt: 'check' }] } as never)
+  await clock.advance(55 * MIN)
+  expect(forks).toEqual([])
+})
+
+test('a wakeup that does not come: judged just after it was due', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const now = Date.UTC(2026, 9, 17, 10, 0)
+  const { clock, forks } = world(on, { now })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '一小时内再看一次')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [], session_crons: [{ id: 'c1', schedule: cronAt(now + 55 * MIN), recurring: false, prompt: 'check' }] } as never)
+  await clock.advance(57 * MIN)
+  expect(forks).toEqual(['judge'])
+})
+
+test('a daily cron is no wakeup within the hour: judged as usual', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const { clock, forks } = world(on)
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '每天早上九点汇报')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [], session_crons: [{ id: 'c1', schedule: '0 9 * * *', recurring: true, prompt: 'report' }] } as never)
+  await clock.advance(51 * MIN)
+  expect(forks).toEqual(['judge'])
+})
+
+test('an idle teammate is not background work: judged as usual', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const { clock, forks } = world(on)
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '先这样')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 't1', type: 'teammate', status: 'idle', description: 'researcher' }] } as never)
   await clock.advance(51 * MIN)
   expect(forks).toEqual(['judge'])
 })
