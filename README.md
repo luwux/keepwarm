@@ -75,12 +75,16 @@ and speaks up *before* the hour runs out.
   nothing goes to the Mac's notifications or the phone (the opt-in alerts below aside).
 - **Alerts** (`/keepwarm alert on`, off by default): only for what should not happen: a window
   whose pings could not go out, the cache rewritten within the hour on the same model, the ping
-  limit reached, or keepwarm's own daily budget (`dailyBudgetUsd`, $10) exceeded.
+  limit reached, or keepwarm's own daily budget (`dailyBudgetUsd`, $30) exceeded.
 - **Leaving**: `/keepwarm leave 2h` asks every live, warm session for its own verdict and shows
   one summary.
 - **Not while the Mac sleeps**: with the lid closed the Mac wakes for seconds now and then; no
   judge or ping goes out then, since the sleep that follows cuts it and it is sent again after the
   cache has lapsed.
+- **Not while the server drops caches**: when two sessions have had their cache written again
+  unexpectedly within the hour, the server is evicting caches early (idle sessions first) or every
+  prefix just changed; for that hour no automatic judge or ping goes out, since each would mostly
+  find its cache gone and write it whole for nothing.
 - **Never blocks** a prompt unless you turn `guard refuse` on.
 
 ## Every request is accounted for

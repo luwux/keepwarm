@@ -325,3 +325,65 @@ for (const verdict of ['keepwarm', 'compact']) {
     expect(compactions).toEqual([])
   })
 }
+
+// 10-19: the server evicted caches for forty minutes; every ping and judge then wrote a whole
+// context ($2-3), and those writes tipped the daily budget, which stopped all judging until midnight.
+const MISS = (sid: string, at: number) => ({ sid, at, cause: 'other', tokens: 300_000, usd: 2.4, gapMs: 10 * MIN })
+
+test('while the server drops caches no judge goes out', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const now = Date.UTC(2026, 9, 14, 20, 0)
+  const { clock, forks } = world(on, { now, store: { misses: [MISS('a', now + 30 * MIN), MISS('b', now + 40 * MIN)] } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '先到这里')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+
+  await clock.advance(3 * 60 * MIN)
+  expect(forks).toEqual([])
+})
+
+test('one session written again unexpectedly is no storm: judged as usual', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const now = Date.UTC(2026, 9, 14, 20, 0)
+  const { clock, forks } = world(on, { now, store: { misses: [MISS('a', now + 30 * MIN), MISS('a', now + 40 * MIN)] } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '先到这里')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+
+  await clock.advance(51 * MIN)
+  expect(forks).toEqual(['judge'])
+})
+
+test('a keep-warm ping is not sent while the server drops caches', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const now = Date.UTC(2026, 9, 14, 20, 0)
+  const { clock, forks } = world(on, { now, store: { misses: [MISS('a', now + 50 * MIN), MISS('b', now + 52 * MIN)] } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '跑一个 3 小时的评测')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 'a1', type: 'subagent', status: 'running', description: 'Test-set eval' }] } as never)
+
+  await clock.advance(3 * 60 * MIN)
+  expect(forks).toEqual([])
+})
+
+test('the budget is counted afresh: a mark from a lower limit does not stop the judge', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const now = new Date(2026, 9, 19, 9, 0).getTime()
+  const day = new Date(2026, 9, 19).getTime()
+  const spent = [{ at: now - 60 * MIN, kind: 'request', what: '保温 ping', usd: 10.2, sid: 'a' }]
+  const { clock, forks } = world(on, { now, store: { budgetHit: day, audit: spent } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '先到这里')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+
+  await clock.advance(51 * MIN)
+  expect(forks).toEqual(['judge'])
+})
+
+test('past the budget no judge goes out', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const now = new Date(2026, 9, 19, 9, 0).getTime()
+  const spent = [{ at: now - 60 * MIN, kind: 'request', what: '保温 ping', usd: 31, sid: 'a' }]
+  const { clock, forks } = world(on, { now, store: { audit: spent } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '先到这里')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+
+  await clock.advance(3 * 60 * MIN)
+  expect(forks).toEqual([])
+})

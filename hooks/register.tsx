@@ -38,8 +38,10 @@ const cfg = {
   pingLimit: 15,
   pingLimitHours: 12,
   // What keepwarm may spend a day on its own (idle judges, pings of windows the model opened);
-  // past it the idle check falls back to the free notice until midnight. 0: no limit.
-  dailyBudgetUsd: 10,
+  // past it the idle check falls back to the free notice until midnight. 0: no limit. A busy day
+  // spends $3-10; $10 was hit on 10-19 at 02:46 by cold forks in a cache eviction, and the
+  // nineteen hours without judges that followed cost about $17 in rewrites.
+  dailyBudgetUsd: 30,
   idleDefault: 'notify' as Idle,
   // Desktop sidebar groups (lower case) whose sessions get no idle check: chats used once and left.
   skipGroups: ['chat'],
@@ -633,13 +635,16 @@ async function spendToday($: EngineInterface, now: number): Promise<{ auto: numb
   return out
 }
 
+// Counted afresh each time, against this process's own limit: a mark left by another process,
+// or by a lower limit before an update, does not hold this one back.
 async function overBudget($: EngineInterface): Promise<boolean> {
-  return cfg.dailyBudgetUsd > 0 && (await $.store.get('budgetHit')) === dayStart(await $.clock.now())
+  return cfg.dailyBudgetUsd > 0 && (await spendToday($, await $.clock.now())).auto > cfg.dailyBudgetUsd
 }
 
 async function checkBudget($: EngineInterface, s: State) {
-  if (!cfg.dailyBudgetUsd || (await overBudget($))) return
+  if (!cfg.dailyBudgetUsd) return
   const now = await $.clock.now()
+  if ((await $.store.get('budgetHit')) === dayStart(now)) return // told once a day
   const spent = (await spendToday($, now)).auto
   if (spent <= cfg.dailyBudgetUsd) return
   await $.store.set('budgetHit', dayStart(now))
@@ -647,6 +652,22 @@ async function checkBudget($: EngineInterface, s: State) {
   const msg = `keepwarm 今天自己花了 ${fmtUsd(spent)}（上限 $${cfg.dailyBudgetUsd}），午夜前空闲检查改为免费提醒；你开的保温照常。`
   $.ui.toast(msg)
   await alarm($, s, 'budget', '自动花费超过上限', msg)
+}
+
+// The server evicting caches before the hour is out (10-19: nine sessions in forty minutes; 10-15:
+// an app update changed every session's prefix at once). Idle sessions go first, so a ping or a
+// judge then mostly finds the cache gone and writes it whole for nothing ($2-3 each). Two sessions
+// written again unexpectedly within the hour mark one; 17 days had three.
+const STORM_MS = 60 * 60_000
+async function storm($: EngineInterface, now: number): Promise<boolean> {
+  type Rec = { sid: string; at: number; cause?: string; read?: number; write?: number }
+  const get = async (k: string) => (((await $.store.get(k)) as Rec[] | undefined) ?? []).filter(r => now - r.at < STORM_MS)
+  const hit = new Set<string>()
+  for (const r of await get('misses')) if (r.cause === 'other') hit.add(r.sid)
+  for (const r of [...(await get('pings')), ...(await get('judgements'))]) {
+    if (!forkWasWarm({ cache_read_input_tokens: r.read ?? 0, cache_creation_input_tokens: r.write ?? 0 } as Usage)) hit.add(r.sid)
+  }
+  return hit.size >= 2
 }
 
 async function alertLine($: EngineInterface, now: number): Promise<string> {
@@ -1067,6 +1088,7 @@ async function ping($: EngineInterface, s: State) {
     await alarm($, s, 'pinglimit', 'ping 次数到了上限', `${why}，保温已停。正常每 55 分钟一次，到上限多半是哪里出了问题，看 /keepwarm log。`)
     return stop($, s, why)
   }
+  if (s.owner !== 'user' && (await storm($, now))) return stop($, s, '这一小时里服务端在提前清缓存，ping 多半碰上已清掉的缓存、白写一次')
   const reply = await auditedFork($, s, s.wakePrompt ? '保温 ping（带唤醒判断）' : '保温 ping', s.wakePrompt ? wakeJudgePrompt(s, now) : PING_PROMPT, s.owner === 'user')
   if (s.owner !== 'user') await checkBudget($, s)
   if (!reply.isAnswered && reply.reason === 'nothing-to-fork') return stop($, s, '没有可以 fork 的对话')
@@ -1404,6 +1426,10 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
     const left = fmtDuration(TTL_MS - (now - s.lastRequestAt))
     const msg = `缓存约 ${left} 后过期。上下文 ${fmtTok(s.ctx)}，过期后重写约 ${fmtUsd(coldUsd(s))}，保温约 ${fmtUsd(hourUsd(s))}/h`
     await alert($, s, '缓存快过期', msg, [warmButton(3), warmButton(8), COMPACT_BUTTON])
+    return arm($, s)
+  }
+  if (!forced && (await storm($, now))) {
+    await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'ignore', reason: '这一小时里服务端在提前清缓存，判断多半碰上已清掉的缓存', chosen: 'storm', by: 'auto' })
     return arm($, s)
   }
   const reply = await auditedFork($, s, forced ? '空闲判断（手动 check）' : '空闲判断（50 分钟）', judgePrompt(s, now - s.lastRequestAt), forced)
