@@ -34,7 +34,9 @@ and speaks up *before* the hour runs out.
   12. A watch on a published artifact and an idle teammate do not count (they wake nobody), nor,
   after the app restarts, the work of the process before (it died with it). Otherwise, with `idleCheck: judge` a fork of
   the session decides whether to compact, keep warm or leave it; the fork reads the cache (about
-  $0.03–0.10 at 100–400K tokens) and refreshes it. Then, with no notification:
+  $0.03–0.10 at 100–400K tokens) and refreshes it. If the judge finds the cache already gone (the
+  server sometimes drops it within the hour), nothing more is done: keeping warm or compacting would
+  pay the rewrite a second time. Otherwise, with no notification:
   - compact: the session is compacted about 55 minutes later, when the hour the judge's own
     read bought is nearly over; it costs the same, and coming back before then keeps the full
     context;

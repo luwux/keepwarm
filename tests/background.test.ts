@@ -4,8 +4,8 @@ const MIN = 60_000
 const CTX = 300_000
 
 // The engine beneath: a 300K session on Opus, an idle Mac, and a fork that counts its calls.
-type World = { cwd?: string; verdict?: string; judgeMs?: number; now?: number; idleS?: number; store?: Record<string, unknown>; ctx?: number; power?: { dark: boolean } }
-function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', verdict = 'keepwarm', judgeMs = 0, now = Date.UTC(2026, 9, 14, 20, 0), idleS = 0, store = {}, ctx = CTX, power = { dark: false } }: World = {}) {
+type World = { cwd?: string; verdict?: string; judgeMs?: number; now?: number; idleS?: number; store?: Record<string, unknown>; ctx?: number; power?: { dark: boolean }; judgeCold?: boolean }
+function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', verdict = 'keepwarm', judgeMs = 0, now = Date.UTC(2026, 9, 14, 20, 0), idleS = 0, store = {}, ctx = CTX, power = { dark: false }, judgeCold = false }: World = {}) {
   const clock = mock.clock(on, { now })
   mock.store(on, store)
   const forks: string[] = []
@@ -40,7 +40,7 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], { cwd = '/tmp/p', 
     const judge = e.prompt.startsWith('[keepwarm 自动检查')
     forks.push(judge ? 'judge' : 'ping')
     if (judge && judgeMs) await clock.sleep(judgeMs)
-    return { value: { isAnswered: true, text: `{"action":"${verdict}","topic":"t","reason":"r","hours":3}`, usage: { cache_read_input_tokens: CTX, cache_creation_input_tokens: 0, input_tokens: 16, output_tokens: 4 } } } as never
+    return { value: { isAnswered: true, text: `{"action":"${verdict}","topic":"t","reason":"r","hours":3}`, usage: judge && judgeCold ? { cache_read_input_tokens: 50_000, cache_creation_input_tokens: CTX - 50_000, input_tokens: 16, output_tokens: 4 } : { cache_read_input_tokens: CTX, cache_creation_input_tokens: 0, input_tokens: 16, output_tokens: 4 } } } as never
   })
   return { clock, forks, compactions, logs }
 }
@@ -310,3 +310,18 @@ test('an idle teammate is not background work: judged as usual', { options: { id
   await clock.advance(51 * MIN)
   expect(forks).toEqual(['judge'])
 })
+
+// 10-19: the server dropped caches within the hour; a judge then wrote the whole context again,
+// a ping five minutes later read the judge's copy, and the person's next message wrote it once more.
+for (const verdict of ['keepwarm', 'compact']) {
+  test(`a judge that finds the cache gone (${verdict}): no ping and no compaction after it`, { options: { idleCheck: 'judge' } }, async ($, on) => {
+    const { clock, forks, compactions } = world(on, { verdict, judgeCold: true })
+    await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+    await turn($, 'composer', '先到这里')
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+
+    await clock.advance(6 * 60 * MIN)
+    expect(forks).toEqual(['judge'])
+    expect(compactions).toEqual([])
+  })
+}

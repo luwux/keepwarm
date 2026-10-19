@@ -722,7 +722,7 @@ function guardText(s: State, now: number): string {
     `这次发送要重写约 ${fmtTok(s.ctx)} tokens，约 ${fmtUsd(coldUsd(s))}（热的话只要 ${fmtUsd(warm)}）。`
 }
 
-const MISS_ZH = { expired: '缓存过期', model: '换了模型', other: '提示前缀变了' } as const
+const MISS_ZH = { expired: '缓存过期', model: '换了模型', other: '缓存提前没了' } as const
 
 // Judged per request, not per turn: a long turn whose context grows step by step writes a lot
 // in total and is not a miss, while a rewrite in the middle of a turn (after a foreground
@@ -753,7 +753,7 @@ async function checkMiss($: EngineInterface, s: State, u: TurnUsage, prevAt: num
   const by = s.turnBy === 'person' ? '' : s.turnBy === 'task-notification' ? '，后台任务回报时' : `，${s.turnBy} 触发`
   const what = `${fmtTok(write)} tokens，约 ${fmtUsd(miss.usd)}`
   $.ui.toast(
-    cause === 'other' ? `意外整段重写 ${what}：同一模型、距上次请求只有 ${fmtDuration(gapMs)}，可能是系统提示或工具列表变了${by}`
+    cause === 'other' ? `意外整段重写 ${what}：同一模型、距上次请求只有 ${fmtDuration(gapMs)}，可能是服务端提前清掉了缓存，或系统提示、工具列表变了${by}`
     : cause === 'expired' && s.deadline ? `保温期间缓存过期，重写 ${what}（距上次请求 ${fmtDuration(gapMs)}${by}）`
     : `冷写入 ${what}（${MISS_ZH[cause]}${prevAt ? `，距上次请求 ${fmtDuration(gapMs)}` : ''}${by}）`,
   )
@@ -1419,6 +1419,14 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
   const v = parseVerdict(reply.text) ?? { action: 'keepwarm' as const, topic: '', reason: '判断结果无法解析，默认建议保温', hours: 3 }
   const a: KeepwarmAdvice = { ...v, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd, at: now, auto: s.policy === 'auto' }
   await appendLog($, 'judgements', { sid: s.sid, cwd: s.cwd, model: s.lastModel, ...a, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens })
+  if (!forced && !forkWasWarm(u)) {
+    // The judge found the cache already gone (10-19: evicted within the hour, nine sessions in
+    // forty minutes) and wrote it again, but only for forks: the session's next turn wrote it once
+    // more, and a ping would read the judge's copy and look warm. Keeping warm or compacting now
+    // would only pay a second rewrite; leave it to the session's next turn.
+    await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: a.ctx, advised: a.action, reason: '判断时缓存已经丢了，保温或压缩都要再重写一次', chosen: 'judge-cold', by: 'auto' })
+    return arm($, s)
+  }
   if (forced) {
     // /keepwarm check: the person asked, so show the advice and let them choose.
     if (a.action !== 'ignore') await offerAdvice($, s, a)
