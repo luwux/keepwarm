@@ -248,6 +248,41 @@ test('a keep-warm ping is held during a dark wake and goes out on the full wake'
   expect(forks).toEqual(['judge', 'ping'])
 })
 
+test('a compaction due during a dark wake waits for the full wake', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const power = { dark: false }
+  const { clock, forks, compactions } = world(on, { verdict: 'compact', power })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '先到这里')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+  await clock.advance(51 * MIN)
+  expect(forks).toEqual(['judge'])
+  power.dark = true // the window ends 55 minutes after the judge, with the lid closed
+  await clock.advance(57 * MIN)
+  expect(compactions).toEqual([])
+  power.dark = false
+  await clock.advance(2 * MIN)
+  expect(compactions).toHaveLength(1)
+})
+
+// Back in the hour's last half minute (the lid opened, the process started): a request would
+// likely reach the cache after it lapsed.
+const BACK = Date.UTC(2026, 9, 14, 20, 0)
+const lastRead = { 'rt:sid-1': { lastRequestAt: BACK - 59 * MIN - 40_000, turnAt: BACK - 59 * MIN - 40_000, ctx: CTX, window: 1_000_000, model: 'claude-opus-5-5', compacted: false } }
+
+test('back in the last half minute: no judge', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const { clock, forks } = world(on, { now: BACK, store: { ...lastRead } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await clock.advance(5 * MIN)
+  expect(forks).toEqual([])
+})
+
+test('back in the last half minute: no ping', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const { clock, forks } = world(on, { now: BACK, store: { ...lastRead, 'deadline:sid-1': BACK + 2 * 60 * MIN, 'owner:sid-1': 'model', 'reason:sid-1': 'r' } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await clock.advance(5 * MIN)
+  expect(forks).toEqual([])
+})
+
 test('a watch on a published artifact is not background work: the session is judged as usual', { options: { idleCheck: 'judge' } }, async ($, on) => {
   const { clock, forks } = world(on)
   await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })

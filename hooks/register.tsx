@@ -208,6 +208,10 @@ const fmtTok = (n: number) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1000 
 const coldUsd = (s: State) => { const p = priceOf(s.lastModel); return p ? s.ctx * p[1] / 1e6 : null }
 const hourUsd = (s: State) => { const p = priceOf(s.lastModel); return p ? s.ctx * p[0] / 1e6 * (TTL_MS / s.every) : null }
 const isCold = (s: State, now: number) => s.lastRequestAt > 0 && !s.compacted && now - s.lastRequestAt >= TTL_MS
+// Too late to send: a request takes seconds to reach the cache (a 300K fork, more), so one sent in
+// the hour's last half minute (a lid opened at 59:58) may find it gone and write it all again.
+const SEND_MARGIN_MS = 30_000
+const tooLate = (s: State, now: number) => s.lastRequestAt > 0 && !s.compacted && now - s.lastRequestAt >= TTL_MS - SEND_MARGIN_MS
 const key = (s: State, k: string) => `${k}:${s.sid}`
 const project = (s: State) => s.cwd.split('/').filter(Boolean).pop() ?? s.cwd
 
@@ -853,8 +857,14 @@ async function arm($: EngineInterface, s: State) {
   disarmCheck(s)
   const now = await $.clock.now()
   if (s.deadline && now >= s.deadline) {
+    const compact = s.thenCompact && !s.compacted && !tooLate(s, now)
+    if (compact && (await darkWake($))) {
+      // The compaction is a request too (10-20: due at 08:45 with the lid closed, it went out on
+      // the full wake at 08:58, seven minutes before the cache lapsed): wait for the full wake.
+      s.pending = $.clock.after(60_000, () => { void arm($, s) })
+      return
+    }
     await audit($, s, 'change', '保温到期结束', { owner: s.owner })
-    const compact = s.thenCompact && !s.compacted && !isCold(s, now)
     s.deadline = 0
     s.owner = null
     s.thenCompact = false
@@ -1071,7 +1081,7 @@ async function ping($: EngineInterface, s: State) {
     s.pending = $.clock.after(s.wakeAt + WAKE_MARGIN_MS / 2 - now, () => { void ping($, s) })
     return
   }
-  if (isCold(s, now)) return lapsedWindow($, s, s.deadline, '电脑睡眠或进程暂停超过 1 小时，ping 没能按时发出')
+  if (tooLate(s, now)) return lapsedWindow($, s, s.deadline, '电脑睡眠或进程暂停到快满 1 小时，ping 没能按时发出')
   if (await darkWake($)) {
     // Asleep but for a moment: try again; on the full wake the timer fires late and finds out.
     s.pending = $.clock.after(60_000, () => { void ping($, s) })
@@ -1380,6 +1390,12 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
   s.check = null
   const now = await $.clock.now()
   if (!forced && (s.deadline || isCold(s, now) || s.compacted || now - s.lastRequestAt < CHECK_AFTER_MS - 1000)) return arm($, s)
+  if (!forced && tooLate(s, now)) {
+    // Back from sleep with seconds left: a judge would likely write the cache again.
+    s.checkedFor = s.turnAt
+    await appendLog($, 'decisions', { sid: s.sid, cwd: s.cwd, at: now, ctx: s.ctx, advised: 'ignore', reason: '缓存只剩不到半分钟，来不及判断', chosen: 'too-late', by: 'auto' })
+    return arm($, s)
+  }
   if (!forced && (await darkWake($))) {
     s.check = $.clock.after(60_000, () => { void idleCheck($, s) })
     return

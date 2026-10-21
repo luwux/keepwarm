@@ -79,8 +79,10 @@ and speaks up *before* the hour runs out.
 - **Leaving**: `/keepwarm leave 2h` asks every live, warm session for its own verdict and shows
   one summary.
 - **Not while the Mac sleeps**: with the lid closed the Mac wakes for seconds now and then; no
-  judge or ping goes out then, since the sleep that follows cuts it and it is sent again after the
-  cache has lapsed.
+  judge, ping or compaction goes out then, since the sleep that follows cuts it and it is sent
+  again after the cache has lapsed. Timers keep wall-clock time: one that came due during the
+  sleep runs on the full wake, unless the cache has under half a minute left (or is gone), when
+  nothing is sent.
 - **Not while the server drops caches**: when two sessions have had their cache written again
   unexpectedly within the hour, the server is evicting caches early (idle sessions first) or every
   prefix just changed; for that hour no automatic judge or ping goes out, since each would mostly
