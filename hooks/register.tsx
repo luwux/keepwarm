@@ -120,6 +120,9 @@ type State = {
   // What the last main-loop request carried, and on which model: the next one is held to it.
   stepCtx: number
   stepModel: string | null
+  // When the cache was last known refreshed, held while main-loop requests go unanswered
+  // (interrupted or failed before any usage came back): those may never have reached it.
+  unansweredFrom: number
   // The first request after a compaction writes the summary; that is not a miss.
   skipMiss: boolean
   // What started the current turn: 'person', or the origin of a turn nobody typed.
@@ -1116,6 +1119,7 @@ async function ping($: EngineInterface, s: State) {
   const got = `ping 读 ${fmtTok(u.cache_read_input_tokens)}、写 ${fmtTok(u.cache_creation_input_tokens)}`
   if (!warm) return stop($, s, s.turnError ? `${got}：上一轮因 API 错误（如额度用完）中断后，ping 对不上主对话的缓存` : `${got}，缓存已经丢了`)
   s.lastRequestAt = now
+  s.unansweredFrom = 0
   await arm($, s)
 }
 
@@ -1254,7 +1258,7 @@ async function leaveCheck($: EngineInterface, s: State, hours: number, machineOn
   let v = null as ReturnType<typeof parseVerdict>
   if (reply.isAnswered) {
     judgeUsd = forkUsd(reply.usage, priceOf(s.lastModel))
-    if (forkWasWarm(reply.usage)) s.lastRequestAt = now
+    if (forkWasWarm(reply.usage)) s.lastRequestAt = now, s.unansweredFrom = 0
     v = parseVerdict(reply.text)
   }
   if (!v) {
@@ -1457,7 +1461,7 @@ async function idleCheck($: EngineInterface, s: State, forced = false) {
   const u = reply.usage
   const judgeUsd = forkUsd(u, priceOf(s.lastModel))
   // The fork read the whole prefix, so the cache is good for another hour.
-  if (forkWasWarm(u)) s.lastRequestAt = now
+  if (forkWasWarm(u)) s.lastRequestAt = now, s.unansweredFrom = 0
   const v = parseVerdict(reply.text) ?? { action: 'keepwarm' as const, topic: '', reason: '判断结果无法解析，默认建议保温', hours: 3 }
   const a: KeepwarmAdvice = { ...v, ctx: s.ctx, coldUsd: coldUsd(s), hourUsd: hourUsd(s), judgeUsd, at: now, auto: s.policy === 'auto' }
   await appendLog($, 'judgements', { sid: s.sid, cwd: s.cwd, model: s.lastModel, ...a, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens })
@@ -1512,7 +1516,7 @@ export const register: Register = (on, options) => {
   const idle = options.idleCheck
   cfg.idleDefault = idle === 'off' || idle === 'judge' ? idle : 'notify'
   const s: State = {
-    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, skipMiss: false, turnBy: 'person', misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
+    sid: '', cwd: '', policy: 'ask', guard: 'warn', ackedAt: 0, stepCtx: 0, stepModel: null, unansweredFrom: 0, skipMiss: false, turnBy: 'person', misses: [], deadline: 0, every: PING_AFTER_MS, owner: null, reason: '', wakePrompt: '', userOff: false, sticky: false,
     lastRequestAt: 0, lastModel: null, ctx: 0, window: 0, compacted: false, compactions: 0, turnError: false, pending: null, check: null, expire: null, endWarn: null, endWarnedFor: 0, tick: null, caff: null, checkedFor: -1, turnAt: 0, poll: null, collect: null, leaveSeen: '', idle: cfg.idleDefault, thenCompact: false, wakeAt: 0, wakeBySleep: false, bg: [],
     last: null, pings: 0, pingUsd: 0, stopped: null, paneTick: null, phonePoll: null, phoneBusy: false,
   }
@@ -1612,6 +1616,7 @@ export const register: Register = (on, options) => {
       s.stopped = null
       s.ctx = 0
       s.lastRequestAt = 0
+      s.unansweredFrom = 0
       s.turnAt = 0
       s.compacted = false
       s.ackedAt = 0
@@ -1634,6 +1639,7 @@ export const register: Register = (on, options) => {
       const now = await $.clock.now()
       if (typeof e.seconds_since_last_response === 'number') {
         s.turnAt = now - e.seconds_since_last_response * 1000
+        s.unansweredFrom = 0
         s.lastRequestAt = Math.max(s.turnAt, await lastKnownRead($, s, s.ctx, s.turnAt, e.source === 'fork'))
       }
       if (typeof e.model === 'string') s.lastModel = e.model
@@ -1902,8 +1908,11 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     // Every model request of the main loop (a prompt or a tool result going back) reads and
     // refreshes the cache: restart the hour and redraw the footer now, not at turn end.
-    const before = s.lastRequestAt
     if (!e.agentId) {
+      // A request that never answered (10-22: the first message after opening the lid, cut off
+      // by the next one) proves nothing about the cache: a miss right after it is timed from the
+      // last request that did answer, not called unexplained at 0 minutes.
+      s.unansweredFrom ||= s.lastRequestAt
       const now = await $.clock.now()
       s.turnAt = s.lastRequestAt = now
       // The first request after a compaction writes the cache afresh: the hour runs again.
@@ -1912,7 +1921,11 @@ export const register: Register = (on, options) => {
     }
     const res = yield* next(e)
     // Bookkeeping only: whatever goes wrong here must not touch the request.
-    if (!e.agentId && res?.usage) await checkMiss($, s, res.usage, before).catch(err => $.ui.log(`keepwarm：冷写入记录失败 ${errText(err)}`, { to: 'debug' }))
+    if (!e.agentId && res?.usage) {
+      const before = s.unansweredFrom
+      s.unansweredFrom = 0
+      await checkMiss($, s, res.usage, before).catch(err => $.ui.log(`keepwarm：冷写入记录失败 ${errText(err)}`, { to: 'debug' }))
+    }
     return res
   })
 

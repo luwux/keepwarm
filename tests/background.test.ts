@@ -141,6 +141,52 @@ test('a rewrite after the hour is one notice in Claude, and nothing shows under 
   expect(footer.filter(x => x !== undefined)).toEqual([])
 })
 
+test('a request that got no answer does not count as refreshing the cache', { options: { idleCheck: 'off' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 20, 0) })
+  mock.store(on)
+  const notices: string[] = []
+  const toasts: string[] = []
+  const footer: Array<string | undefined> = []
+  let usage: Record<string, unknown> | undefined = { cache_read_input_tokens: CTX, cache_creation_input_tokens: 0, input_tokens: 10, output_tokens: 100, model: 'claude-opus-5-5' }
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  on('session.id', async () => ({ value: 'sid-2' }))
+  on('session.cwd', async () => ({ value: '/tmp/p' }))
+  on('session.surfaces', async () => ({ value: [] }))
+  on('command.register', async () => ({ value: { command: 'keepwarm' } }))
+  on('tool.register', async () => ({ value: { tool: 'keepwarm' } }))
+  on('prompt.submit', async (_$, e) => ({ text: e.text }))
+  on('turn.complete', async () => ({ text: '' }))
+  on('session.usage', async () => ({ value: { context: { tokens: CTX, window: 1_000_000 } } }) as never)
+  on('session.model', async () => ({ value: 'claude-opus-5-5' }))
+  on('ui.status', async (_$, e) => { footer.push((e as { text?: string }).text); return { value: undefined } as never })
+  on('ui.toast', async (_$, e) => { toasts.push((e as { text: string }).text); return { value: undefined } as never })
+  on('ui.log', async () => ({ value: undefined }) as never)
+  on('process.run', async (_$, e) => {
+    const argv = (e as { argv: string[] }).argv
+    if (argv[0] === 'terminal-notifier') notices.push(argv.join(' '))
+    return { value: { exitCode: 0, stdout: '', stderr: '' } } as never
+  })
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
+  })
+  async function step(text: string) {
+    await $.prompt.submit({ text, origin: { kind: 'composer' } } as never)
+    for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude-opus-5-5' } as never)) { /* drain */ }
+    await $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  }
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await step('第一条')
+  await clock.advance(90 * MIN) // the lid was closed
+  usage = undefined
+  await step('开盖回来') // interrupted before any answer came back (10-22)
+  await clock.advance(11_000)
+  usage = { cache_read_input_tokens: 40_000, cache_creation_input_tokens: CTX - 40_000, input_tokens: 10, output_tokens: 100, model: 'claude-opus-5-5' }
+  await step('go')
+  expect(toasts.filter(x => x.startsWith('冷写入'))).toHaveLength(1)
+  expect(toasts.at(-1)).toContain('缓存过期')
+  expect(toasts.join()).not.toContain('意外')
+})
+
 test('a judged compaction waits out the hour the judge refreshed, with no ping before it', { options: { idleCheck: 'judge' } }, async ($, on) => {
   const { clock, forks, compactions } = world(on, { verdict: 'compact', judgeMs: 8000 }) // the judge's fork takes 8 s, as it did (10-15)
   await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
