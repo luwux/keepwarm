@@ -667,10 +667,12 @@ async function checkBudget($: EngineInterface, s: State) {
 // written again unexpectedly within the hour mark one; 17 days had three.
 const STORM_MS = 60 * 60_000
 async function storm($: EngineInterface, now: number): Promise<boolean> {
-  type Rec = { sid: string; at: number; cause?: string; read?: number; write?: number }
+  type Rec = { sid: string; at: number; cause?: string; gapMs?: number; read?: number; write?: number }
   const get = async (k: string) => (((await $.store.get(k)) as Rec[] | undefined) ?? []).filter(r => now - r.at < STORM_MS)
   const hit = new Set<string>()
-  for (const r of await get('misses')) if (r.cause === 'other') hit.add(r.sid)
+  // A rewrite seconds after the last request is the client changing the prefix (a test forking
+  // one base many ways, 10-25), not the server: evictions found idle sessions, 2.7 min and up.
+  for (const r of await get('misses')) if (r.cause === 'other' && (r.gapMs ?? 0) >= 2 * 60_000) hit.add(r.sid)
   for (const r of [...(await get('pings')), ...(await get('judgements'))]) {
     if (!forkWasWarm({ cache_read_input_tokens: r.read ?? 0, cache_creation_input_tokens: r.write ?? 0 } as Usage)) hit.add(r.sid)
   }

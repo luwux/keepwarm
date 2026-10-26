@@ -433,6 +433,18 @@ test('one session written again unexpectedly is no storm: judged as usual', { op
   expect(forks).toEqual(['judge'])
 })
 
+test('rewrites seconds apart are the client, not the server: judged as usual', { options: { idleCheck: 'judge' } }, async ($, on) => {
+  const now = Date.UTC(2026, 9, 14, 20, 0)
+  const quick = (sid: string, at: number) => ({ ...MISS(sid, at), gapMs: 10_000 })
+  const { clock, forks } = world(on, { now, store: { misses: [quick('a', now + 30 * MIN), quick('b', now + 40 * MIN)] } })
+  await $.session.start({ cwd: '/tmp/p', surface: null, isInteractive: true })
+  await turn($, 'composer', '先到这里')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+
+  await clock.advance(51 * MIN)
+  expect(forks).toEqual(['judge'])
+})
+
 test('a keep-warm ping is not sent while the server drops caches', { options: { idleCheck: 'judge' } }, async ($, on) => {
   const now = Date.UTC(2026, 9, 14, 20, 0)
   const { clock, forks } = world(on, { now, store: { misses: [MISS('a', now + 50 * MIN), MISS('b', now + 52 * MIN)] } })
